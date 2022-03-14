@@ -1,0 +1,38 @@
+training_modifiers:
+  
+  - !EpochRangeModifier
+    start_epoch: 0
+    end_epoch: 10
+  
+  - !LearningRateFunctionModifier
+    start_epoch: 0
+    end_epoch: 1
+    lr_func: linear
+    init_lr: 0.001
+    final_lr: 0.1
+
+  - !LearningRateFunctionModifier
+    start_epoch: 1
+    end_epoch: 5
+    lr_func: cosine
+    init_lr: 0.1
+    final_lr: 0.00001
+  
+pruning_modifiers:
+
+  - !ACDCPruningModifier
+    compression_sparsity: 0.6
+    start_epoch: 1
+    end_epoch: 6
+    update_frequency: 1
+    params: ['re:.*conv.*.weight'] 
+    global_sparsity: True
+
+  - !GMPruningModifier
+    init_sparsity: 0.6
+    final_sparsity: 0.6
+    start_epoch: 6
+    end_epoch: 10
+    update_frequency: -1
+    params: ['re:.*conv.*.weight'] 
+    mask_type: unstructured

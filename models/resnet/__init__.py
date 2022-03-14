@@ -1,0 +1,1 @@
+from .resnet_cifar10 import ResNetCifar, resnet20, resnet32, resnet44, resnet56
