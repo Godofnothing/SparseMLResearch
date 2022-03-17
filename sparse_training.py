@@ -40,7 +40,7 @@ from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 # sparseml imports
 from sparseml.pytorch.optim import ScheduledModifierManager
-from sparseml.pytorch.utils import load_model, save_model, load_optimizer
+from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_manager, load_epoch
 # import utils
 from utils import mean_value, get_current_pruning_modifier, \
     get_current_learning_rate_modifier, is_update_epoch, \
@@ -485,11 +485,18 @@ def main():
     # optionally resume from a checkpoint
     resume_epoch = None
     if args.resume:
-        resume_epoch = resume_checkpoint(
-            model, args.resume,
-            optimizer=None if args.no_resume_opt else optimizer,
-            loss_scaler=None if args.no_resume_opt else loss_scaler,
-            log_info=args.local_rank == 0)
+        # load model checkpoint
+        load_model(args.resume, model, fix_data_parallel=True)
+        if args.local_rank == 0:
+            _logger.info(f'Loading model from checkpoint {args.resume}')
+        # load optimizer
+        if not args.no_resume_opt:
+            if args.local_rank == 0:
+                _logger.info(f'Loading optimizer from checkpoint {args.resume}')
+            load_optimizer(args.resume, optimizer, map_location=args.device)
+        resume_epoch = load_epoch(args.resume, map_location=args.device)
+        if args.local_rank == 0:
+            _logger.info(f'Starting training from {resume_epoch} epoch')
 
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
@@ -497,8 +504,6 @@ def main():
         # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
         model_ema = ModelEmaV2(
             model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
-        if args.resume:
-            load_checkpoint(model_ema.module, args.resume, use_ema=True)
 
     # setup distributed training
     if args.distributed:
@@ -650,6 +655,9 @@ def main():
     ############$############
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
+    # resume manager state (if needed)
+    if args.resume:
+        load_manager(args.resume, manager, map_location=args.device)
     # wrap optimizer   
     optimizer = manager.modify(model, optimizer, steps_per_epoch=len(loader_train))
     # override timm scheduler
@@ -686,19 +694,11 @@ def main():
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
-            # make guard
-            guard_variable = True
-
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
                 lr_scheduler=lr_scheduler, output_dir=output_dir, amp_autocast=amp_autocast, 
                 loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn
             )
-
-            if guard_variable:
-                guard_variable = False
-            else:
-                continue
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                 if args.local_rank == 0:

@@ -6,4 +6,6 @@ def mean_value(values: Union[int, float, list]):
         return values
     if isinstance(values, list):
         return sum(values) / len(values)
+    else:
+        return 0.0
         
