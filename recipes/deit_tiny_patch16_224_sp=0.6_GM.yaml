@@ -2,7 +2,7 @@ training_modifiers:
   
   - !EpochRangeModifier
     start_epoch: 0
-    end_epoch: 1000
+    end_epoch: 600
   
   - !LearningRateFunctionModifier
     start_epoch: 0
@@ -13,7 +13,7 @@ training_modifiers:
 
   - !LearningRateFunctionModifier
     start_epoch: 20
-    end_epoch: 1000
+    end_epoch: 600
     lr_func: cosine
     init_lr: 0.0007
     final_lr: 0.000001
@@ -22,20 +22,21 @@ pruning_modifiers:
 
   - !ACDCGlobalMagnitudePruningModifier
     compression_sparsity: 0.6
-    start_epoch: 300
-    end_epoch: 900
-    update_frequency: 50
+    start_epoch: 150
+    end_epoch: 475
+    update_frequency: 25
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     mask_type: unstructured
     global_sparsity : True
 
+
   - !GlobalMagnitudePruningModifier
     init_sparsity: 0.6
     final_sparsity: 0.6
-    start_epoch: 900
-    end_epoch: 1000
-    update_frequency: 100
+    start_epoch: 525
+    end_epoch: 600
+    update_frequency: 75
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     mask_type: unstructured
     global_sparsity : True
-    
+

@@ -1,0 +1,12 @@
+training_modifiers:
+  
+  - !EpochRangeModifier
+    start_epoch: 525
+    end_epoch: 725
+
+  - !LearningRateFunctionModifier
+    start_epoch: 524
+    end_epoch: 725
+    lr_func: cosine
+    init_lr: 0.0001
+    final_lr: 0.000001

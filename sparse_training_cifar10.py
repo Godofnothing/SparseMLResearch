@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR10
 # scheduled modified manager
 from sparseml.pytorch.optim import ScheduledModifierManager
+from sparseml.pytorch.utils import load_model, load_optimizer, load_manager, load_epoch
 # import train
 from engine import train
 # import resnet models
@@ -22,6 +23,8 @@ def get_args_parser():
     parser.add_argument('--model', default='resnet20', type=str)
     # Path to recipe
     parser.add_argument('--recipe-path', required=True, type=str)
+    # Resume path
+    parser.add_argument('--resume', default='', type=str)
     # Logging
     parser.add_argument('--log-wandb', action='store_true')
     # Loss params
@@ -101,16 +104,31 @@ if __name__ == '__main__':
     model = getattr(resnet, args.model)()
     # to device
     model = model.to(device)
-    # define pruner
-    manager = ScheduledModifierManager.from_yaml(args.recipe_path)
-    # number of steps per epoch
-    steps_per_epoch = len(train_loader)
     # optimizer 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    # load checkpoint
+    if args.resume:
+        load_model(args.resume, model)
+        load_optimizer(args.resume, optimizer)
+        start_epoch = load_epoch(args.resume)
+
+    print('starting from ')
+
+    ################
+    ### SparseML ###
+    ################
+
+     # number of steps per epoch
+    steps_per_epoch = len(train_loader)
+    # define pruner
+    manager = ScheduledModifierManager.from_yaml(args.recipe_path)
     # make a pruning modifier
     optimizer = manager.modify(model, optimizer, steps_per_epoch)
     # define loss
     criterion = nn.CrossEntropyLoss(label_smoothing=args.smoothing)
+    # load manager if needed
+    if args.resume:
+        load_manager(args.resume, manager)
 
     history = train(
         model,
@@ -118,8 +136,10 @@ if __name__ == '__main__':
         criterion=criterion, 
         optimizer=optimizer,
         num_epochs=manager.epoch_modifiers[0].end_epoch,
+        save_dir=args.save_dir,
+        start_epoch=start_epoch,
         device=device,
-        log_wandb=args.log_wandb
+        log_wandb=args.log_wandb,
     )
 
     # finalize the model

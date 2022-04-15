@@ -26,7 +26,7 @@ import torch.nn as nn
 import torchvision.utils
 
 from collections import OrderedDict
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from datetime import datetime
 
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
@@ -39,14 +39,16 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 # sparseml imports
-from sparseml.pytorch.optim import ScheduledModifierManager
-from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_manager, load_epoch
+from sparseml.pytorch.optim import EpochRangeModifier, ScheduledModifierManager
+from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_manager, load_epoch, GradSampler
 # import utils
 from utils import mean_value, get_current_pruning_modifier, \
     get_current_learning_rate_modifier, is_update_epoch, \
     get_current_sparsity, get_sparsity_info \
 # import custom schedule
 from schedulers import CosineAnnealingWarmupRestarts
+from optim import create_sam_optimizer, create_topk_sam_optimizer
+from utils.batchnorm_utils import enable_running_stats, disable_running_stats
 
 try:
     from apex import amp
@@ -110,6 +112,8 @@ def parse_args():
                         help='Resume full model and optimizer state from checkpoint (default: none)')
     parser.add_argument('--no-resume-opt', action='store_true', default=False,
                         help='prevent resume of optimizer state when resuming model')
+    parser.add_argument('--no-resume-man', action='store_true', default=False,
+                        help='prevent resume of manager state when resuming model')
     parser.add_argument('--num-classes', type=int, default=None, metavar='N',
                         help='number of label classes (Model default if None)')
     parser.add_argument('--gp', default=None, type=str, metavar='POOL',
@@ -130,6 +134,11 @@ def parse_args():
                         help='input batch size for training (default: 128)')
     parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                         help='validation batch size override (default: None)')
+    parser.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
+                        help='mfac batch size override (default: None)')
+    parser.add_argument('--mfac-loader', action='store_true',
+                        help='whether to use separate loader for MFAC (default: False)')
+    
 
     # Optimizer parameters
     parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
@@ -146,7 +155,12 @@ def parse_args():
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--clip-mode', type=str, default='norm',
                         help='Gradient clipping mode. One of ("norm", "value", "agc")')
-
+    parser.add_argument('--sam', action='store_true',
+                        help='Use sharpness-aware minimizer')
+    parser.add_argument('--sam-topk', default=0.0, type=float,
+                        help='Keep only topk entries')
+    parser.add_argument('--sam-global-sparsity', action='store_true',
+                        help='Use global sparsity for SAM')
 
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
@@ -463,7 +477,12 @@ def main():
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
         model = torch.jit.script(model)
 
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    if args.sam and args.sam_topk == 0:
+        optimizer = create_sam_optimizer(model, args)
+    elif args.sam and args.sam_topk > 0:
+        optimizer = create_topk_sam_optimizer(model, args)
+    else:
+        optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
@@ -630,6 +649,43 @@ def main():
         pin_memory=args.pin_mem,
     )
 
+    # make separate MFAC-loader
+    if args.mfac_loader:
+        loader_mfac = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=args.mfac_batch_size,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            no_aug=args.no_aug,
+            re_prob=args.reprob,
+            re_mode=args.remode,
+            re_count=args.recount,
+            re_split=args.resplit,
+            scale=args.scale,
+            ratio=args.ratio,
+            hflip=args.hflip,
+            vflip=args.vflip,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            num_aug_repeats=args.aug_repeats,
+            num_aug_splits=num_aug_splits,
+            interpolation=train_interpolation,
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=False,
+            collate_fn=collate_fn,
+            pin_memory=args.pin_mem,
+            use_multi_epochs_loader=args.use_multi_epochs_loader,
+            worker_seeding=args.worker_seeding,
+        )
+
+        def mfac_data_generator():
+            for input, target in loader_mfac:
+                input, target = input.to(args.device), target.to(args.device)
+                yield [input], {}, target
+
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -650,24 +706,34 @@ def main():
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
+    if args.mfac_loader:
+        # create grad sampler with the created data laoder and loss function
+        grad_sampler = GradSampler(mfac_data_generator(), train_loss_fn)
+
     #########################
     # Setup SparseML manager
     ############$############
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
     # resume manager state (if needed)
-    if args.resume:
+    if args.resume and not args.no_resume_man:
         load_manager(args.resume, manager, map_location=args.device)
+    bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
     # wrap optimizer   
-    optimizer = manager.modify(model, optimizer, steps_per_epoch=len(loader_train))
+    optimizer = manager.modify(
+        model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, **bonus_kw)
     # override timm scheduler
     if any("LearningRate" in str(modifier) for modifier in manager.modifiers):
         lr_scheduler = None
         if manager.max_epochs:   
-            num_epochs = manager.max_epochs or num_epochs
+            num_epochs = manager.max_epochs
+        # if there is epoch_range modifier - override max_epochs (sparseml ignores bounds in presence of other modifiers)
+        for modifier in manager.modifiers:
+            if isinstance(modifier, EpochRangeModifier):
+                num_epochs = modifier.end_epoch
         if args.local_rank == 0:
             _logger.info("Disabling timm LR scheduler, managing LR using SparseML recipe")
-            _logger.info(f"Overriding max_epochs to {manager.max_epochs} from SparseML recipe")
+            _logger.info(f"Overriding max_epochs to {num_epochs} from SparseML recipe")
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
@@ -718,6 +784,8 @@ def main():
                     ema_eval_metrics = validate(
                         model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
                     eval_metrics = ema_eval_metrics
+            # add mean sparsity to logged dict
+            eval_metrics['sparsity'] = mean_sparsity
 
             if lr_scheduler is not None:
                 if args.sched == 'cosine_annealing':
@@ -744,9 +812,7 @@ def main():
                     )
 
                 # log mean sparsity
-                if args.log_wandb:
-                    _logger.info(f'Mean sparsity: {mean_sparsity:.4f}')
-                    wandb.log({"sparsity" : mean_sparsity}, step=epoch)
+                _logger.info(f'Mean sparsity: {mean_sparsity:.4f}')
 
                 if args.log_sparsity and is_update_epoch(manager, epoch):
                     sparsity_info = json.loads(get_sparsity_info(model))
@@ -796,6 +862,12 @@ def train_one_epoch(
         epoch, model, loader, optimizer, loss_fn, args,
         lr_scheduler=None, output_dir=None, amp_autocast=suppress,
         loss_scaler=None, model_ema=None, mixup_fn=None):
+    
+    # define closure for SAM
+    def closure():
+        loss = loss_fn(model(input), target)
+        loss.backward()
+        return loss
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -823,6 +895,10 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
+        # turn of batch norm stats if needed
+        if args.sam:
+            enable_running_stats(model)
+
         with amp_autocast():
             output = model(input)
             loss = loss_fn(output, target)
@@ -838,12 +914,19 @@ def train_one_epoch(
                 parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
                 create_graph=second_order)
         else:
-            loss.backward(create_graph=second_order)
-            if args.clip_grad is not None:
-                dispatch_clip_grad(
-                    model_parameters(model, exclude_head='agc' in args.clip_mode),
-                    value=args.clip_grad, mode=args.clip_mode)
-            optimizer.step()
+            sync_context = model.no_sync() if args.sam else nullcontext
+            with sync_context:
+                loss.backward(create_graph=second_order)
+                if args.clip_grad is not None:
+                    dispatch_clip_grad(
+                        model_parameters(model, exclude_head='agc' in args.clip_mode),
+                        value=args.clip_grad, mode=args.clip_mode)
+
+            if args.sam:
+                disable_running_stats(model)
+                optimizer.step(closure)
+            else:
+                optimizer.step()
 
         if model_ema is not None:
             model_ema.update(model)
