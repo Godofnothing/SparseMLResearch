@@ -157,6 +157,8 @@ def parse_args():
                         help='Gradient clipping mode. One of ("norm", "value", "agc")')
     parser.add_argument('--sam', action='store_true',
                         help='Use sharpness-aware minimizer')
+    parser.add_argument('--sam-rho', default=0.2, type=float,
+                        help='Parameter rho in the sam optimizer')
     parser.add_argument('--sam-topk', default=0.0, type=float,
                         help='Keep only topk entries')
     parser.add_argument('--sam-global-sparsity', action='store_true',
