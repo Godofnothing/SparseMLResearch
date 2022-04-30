@@ -21,6 +21,8 @@ import yaml
 import logging
 import argparse
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torchvision.utils
@@ -29,6 +31,7 @@ from collections import OrderedDict
 from contextlib import nullcontext, suppress
 from datetime import datetime
 
+from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
@@ -39,8 +42,8 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 # sparseml imports
-from sparseml.pytorch.optim import EpochRangeModifier, ScheduledModifierManager
-from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_manager, load_epoch, GradSampler
+from sparseml.pytorch.optim import ScheduledModifierManager
+from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch, GradSampler
 # import utils
 from utils import mean_value, get_current_pruning_modifier, \
     get_current_learning_rate_modifier, is_update_epoch, \
@@ -347,6 +350,14 @@ def parse_args():
     parser.add_argument('--lr-odd-mult', type=float, default=1.0,
                         help='end of pruning stage')
 
+    # AdaPrune calibration images args
+    parser.add_argument('--load-calibration-images', action='store_true',
+                        help='whether to use calibration images')
+    parser.add_argument('--num-calibration-images', default=1000, type=int,
+                        help='number of images used for calibration')
+    parser.add_argument('--path-to-labels', default='./data/imagenet_train_labels.npy', type=str, 
+                        help='path-to-imagenet-labels')
+
     
     config_args, remaining_args = config_parser.parse_known_args()
     # Do we have a config file to parse?
@@ -554,7 +565,7 @@ def main():
             lr_odd_mult=args.lr_odd_mult
         )
         lr_scheduler, num_epochs = \
-            torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn, last_epoch=start_epoch), args.epochs
+            torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn, last_epoch=args.start_epoch), args.epochs
     else:
         lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
@@ -716,11 +727,22 @@ def main():
     # Setup SparseML manager
     ############$############
 
+    bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
+    # prepare calibration images (if AdaPrune used)
+    if args.load_calibration_images:
+        _logger.info(f"Collecting {args.num_calibration_images} for AdaPrune")
+        train_ids_all = range(len(dataset_train))
+        train_labels_all = np.load(args.path_to_labels)
+        train_ids, _, train_labels, _ =  train_test_split(
+            train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
+        calibration_images = torch.stack(
+            [torch.tensor(dataset_train[i][0], device=args.device, dtype=torch.float32) for i in train_ids], dim=0)
+        bonus_kw['calibration_images'] = calibration_images
+
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
     # resume manager state (if needed)
-    if args.resume and not args.no_resume_man:
-        load_manager(args.resume, manager, map_location=args.device)
-    bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
+    # if args.resume and not args.no_resume_man:
+    #     load_manager(args.resume, manager, map_location=args.device)
     # wrap optimizer   
     optimizer = manager.modify(
         model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, **bonus_kw)
@@ -729,10 +751,6 @@ def main():
         lr_scheduler = None
         if manager.max_epochs:   
             num_epochs = manager.max_epochs
-        # if there is epoch_range modifier - override max_epochs (sparseml ignores bounds in presence of other modifiers)
-        for modifier in manager.modifiers:
-            if isinstance(modifier, EpochRangeModifier):
-                num_epochs = modifier.end_epoch
         if args.local_rank == 0:
             _logger.info("Disabling timm LR scheduler, managing LR using SparseML recipe")
             _logger.info(f"Overriding max_epochs to {num_epochs} from SparseML recipe")
