@@ -26,9 +26,10 @@ pruning_modifiers:
     end_epoch: 475
     update_frequency: 25
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
+    leave_enabled: True
     mask_type: unstructured
     global_sparsity : True
-    num_grads: 256
+    num_grads: 160
     fisher_block_size: 64
     damp: 0.0000001
     grads_device: cpu
@@ -43,7 +44,7 @@ pruning_modifiers:
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     mask_type: unstructured
     global_sparsity : True
-    num_grads: 256
+    num_grads: 160
     fisher_block_size: 64
     damp: 0.0000001
     grads_device: cpu

@@ -1,0 +1,55 @@
+training_modifiers:
+
+  - !EpochRangeModifier
+    start_epoch: 0
+    end_epoch: 300
+  
+  - !LearningRateFunctionModifier
+    start_epoch: 0
+    end_epoch: 200
+    lr_func: cyclic_linear
+    init_lr: 0.0001
+    final_lr: 0.000001
+    cycle_epochs: 5.0   
+
+  - !LearningRateFunctionModifier
+    start_epoch: 200
+    end_epoch: 300
+    lr_func: cosine
+    init_lr: 0.0001
+    final_lr: 0.00001
+  
+pruning_modifiers:
+    
+ - !MFACPruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
+    init_sparsity: 0.1
+    final_sparsity: 0.6
+    start_epoch: 0.0
+    end_epoch: 200.0
+    update_frequency: 5
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
+    leave_enabled: True
+    mask_type: unstructured
+    global_sparsity : True
+    num_grads: 256
+    fisher_block_size: 64
+    damp: 0.0000001
+    grads_device: cpu
+
+ - !MFACPruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
+    init_sparsity: 0.6
+    final_sparsity: 0.6
+    start_epoch: 200.0
+    end_epoch: 300.0
+    update_frequency: 100
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
+    leave_enabled: True
+    mask_type: unstructured
+    global_sparsity : True
+    num_grads: 256
+    fisher_block_size: 64
+    damp: 0.0000001
+    grads_device: cpu
+    

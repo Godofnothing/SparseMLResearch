@@ -54,7 +54,7 @@ def create_topk_sam_optimizer(model, args):
             momentum=args.momentum,
             weight_decay=args.weight_decay,
             topk=args.sam_topk,
-            global_sparsity=args.sam_topk_global
+            global_sparsity=args.sam_global_sparsity
         )
     elif args.opt == 'adam':
         if not args.opt_betas:
@@ -69,7 +69,7 @@ def create_topk_sam_optimizer(model, args):
             betas=args.opt_betas,
             eps=args.eps,
             topk=args.sam_topk,
-            global_sparsity=args.sam_topk_global
+            global_sparsity=args.sam_global_sparsity
         )
 
     elif args.opt == 'adamw':
@@ -85,7 +85,7 @@ def create_topk_sam_optimizer(model, args):
             betas=args.opt_betas,
             eps=args.eps,
             topk=args.sam_topk,
-            global_sparsity=args.sam_topk_global
+            global_sparsity=args.sam_global_sparsity
         )
     else:
         raise NotImplementedError("Unfortunately this kind of optimizer is not supported")

@@ -1,0 +1,13 @@
+pruning_modifiers:
+
+  - !MFACPruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
+    init_sparsity: 0.5
+    final_sparsity: 0.5
+    start_epoch: 0.0
+    end_epoch: 1.0
+    update_frequency: 1.0
+    num_grads: 256
+    fisher_block_size: 64
+    damp: 0.0000001
+    

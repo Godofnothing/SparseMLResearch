@@ -730,7 +730,8 @@ def main():
     bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
     # prepare calibration images (if AdaPrune used)
     if args.load_calibration_images:
-        _logger.info(f"Collecting {args.num_calibration_images} for AdaPrune")
+        if args.local_rank == 0:
+            _logger.info(f"Collecting {args.num_calibration_images} for AdaPrune")
         train_ids_all = range(len(dataset_train))
         train_labels_all = np.load(args.path_to_labels)
         train_ids, _, train_labels, _ =  train_test_split(
@@ -740,12 +741,9 @@ def main():
         bonus_kw['calibration_images'] = calibration_images
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
-    # resume manager state (if needed)
-    # if args.resume and not args.no_resume_man:
-    #     load_manager(args.resume, manager, map_location=args.device)
-    # wrap optimizer   
+    # wrap optimizer  
     optimizer = manager.modify(
-        model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, **bonus_kw)
+        model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, distillation_teacher='self', **bonus_kw) 
     # override timm scheduler
     if any("LearningRate" in str(modifier) for modifier in manager.modifiers):
         lr_scheduler = None

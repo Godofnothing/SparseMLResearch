@@ -1,16 +1,16 @@
-pruning_modifiers:
+training_modifiers:
 
   - !EpochRangeModifier
     start_epoch: 0
     end_epoch: 300
-
+  
   - !LearningRateFunctionModifier
     start_epoch: 0
     end_epoch: 200
     lr_func: cyclic_linear
-    init_lr: 0.0005
-    final_lr: 0.000005
-    cycle_epochs: 20    
+    init_lr: 0.0001
+    final_lr: 0.000001
+    cycle_epochs: 5.0   
 
   - !LearningRateFunctionModifier
     start_epoch: 200
@@ -21,13 +21,13 @@ pruning_modifiers:
   
 pruning_modifiers:
     
- - !AdaPruneGlobalMagnitudePruningModifier
+ - !MagnitudePruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
-    init_sparsity: 0.2
-    final_sparsity: 0.75
+    init_sparsity: 0.1
+    final_sparsity: 0.6
     start_epoch: 0.0
     end_epoch: 200.0
-    update_frequency: 20.0
+    update_frequency: 5.0
     num_recompute: 5
     num_calibration_steps: 5000
     calibration_batch_size: 32
@@ -38,10 +38,10 @@ pruning_modifiers:
     leave_enabled: True
     mask_type: unstructured
 
- - !AdaPruneGlobalMagnitudePruningModifier
+ - !MagnitudePruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
-    init_sparsity: 0.75
-    final_sparsity: 0.75
+    init_sparsity: 0.6
+    final_sparsity: 0.6
     start_epoch: 200.0
     end_epoch: 300.0
     update_frequency: 100
@@ -54,4 +54,4 @@ pruning_modifiers:
     inter_func: cubic
     leave_enabled: True
     mask_type: unstructured
-     
+    
