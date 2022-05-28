@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """ ImageNet Training Script
 
 This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
@@ -15,79 +14,62 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import os
-import time
 import json
 import yaml
 import logging
 import argparse
-
-import numpy as np
+import colorama
 
 import torch
 import torch.nn as nn
-import torchvision.utils
-
-from collections import OrderedDict
-from contextlib import nullcontext, suppress
-from datetime import datetime
 
 from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
-from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
-from timm.models import create_model, safe_model_name, convert_splitbn_model, model_parameters
-from timm.utils import *
-from timm.loss import *
+from timm.data import create_dataset, create_loader, resolve_data_config, \
+    Mixup, FastCollateMixup, AugMixDataset
+from timm.models import create_model, safe_model_name, convert_splitbn_model
+from timm.utils import setup_default_logging, random_seed, get_outdir, distribute_bn, \
+     ModelEmaV2
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
-from timm.utils import ApexScaler, NativeScaler
+from timm.loss import JsdCrossEntropy, BinaryCrossEntropy, SoftTargetCrossEntropy, \
+    BinaryCrossEntropy, LabelSmoothingCrossEntropy
 # sparseml imports
 from sparseml.pytorch.optim import ScheduledModifierManager
-from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch, GradSampler
-# import utils
-from utils import mean_value, get_current_pruning_modifier, \
-    get_current_learning_rate_modifier, is_update_epoch, \
-    get_current_sparsity, get_sparsity_info \
-# import custom schedule
-from schedulers import CosineAnnealingWarmupRestarts
-from optim import create_sam_optimizer, create_topk_sam_optimizer
-from utils.batchnorm_utils import enable_running_stats, disable_running_stats
+from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch, \
+    load_loss_scaler, GradSampler
 
-try:
-    from apex import amp
-    from apex.parallel import DistributedDataParallel as ApexDDP
-    from apex.parallel import convert_syncbn_model
-    has_apex = True
-except ImportError:
-    has_apex = False
+from utils.load_aux_data import load_calibration_images
 
-has_native_amp = False
-try:
-    if getattr(torch.cuda.amp, 'autocast') is not None:
-        has_native_amp = True
-except AttributeError:
-    pass
-
+# import wandb
 try:
     import wandb
     has_wandb = True
 except ImportError: 
     has_wandb = False
 
-torch.backends.cudnn.benchmark = True
-_logger = logging.getLogger('train')
+# local imports
+from utils.manager_utils import is_update_epoch
+from utils.sparsity_utils import get_current_sparsity, get_sparsity_info
+from utils.dist_utils import init_distributed_mode, setup_distributed
+from utils.amp_utils import init_amp_mode, setup_amp
+from utils.training_utils import train_one_epoch, valid_one_epoch, log_on_epoch
+# import custom schedule
+from optim import create_sam_optimizer, create_topk_sam_optimizer
 
 
 def parse_args():
-    config_parser = parser = argparse.ArgumentParser(description='Timm Training Config', add_help=False)
-    parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
-                        help='YAML config file specifying default arguments')
     # The first arg parser parses out only the --config argument, this argument is used to
     # load a yaml file containing key-values that override the defaults for the main parser below
+    config_parser = argparse.ArgumentParser(description='Timm Training Config with SparseML integration',  
+                                     add_help=False)  
+    config_parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
+                        help='YAML config file specifying default arguments')
+    # The main args parser
     parser = argparse.ArgumentParser(description='Sparse training with timm script')
-
     # SparseML recipe
-    parser.add_argument('--sparseml-recipe', required=True, type=str,
+    parser.add_argument('--sparseml-recipe', '-sp', required=True, type=str,
                         help='YAML config file with the sparsification recipe')
 
     # Dataset parameters
@@ -115,8 +97,6 @@ def parse_args():
                         help='Resume full model and optimizer state from checkpoint (default: none)')
     parser.add_argument('--no-resume-opt', action='store_true', default=False,
                         help='prevent resume of optimizer state when resuming model')
-    parser.add_argument('--no-resume-man', action='store_true', default=False,
-                        help='prevent resume of manager state when resuming model')
     parser.add_argument('--num-classes', type=int, default=None, metavar='N',
                         help='number of label classes (Model default if None)')
     parser.add_argument('--gp', default=None, type=str, metavar='POOL',
@@ -137,11 +117,12 @@ def parse_args():
                         help='input batch size for training (default: 128)')
     parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                         help='validation batch size override (default: None)')
-    parser.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
-                        help='mfac batch size override (default: None)')
+
+    # specific options for MFAC loader
     parser.add_argument('--mfac-loader', action='store_true',
                         help='whether to use separate loader for MFAC (default: False)')
-    
+    parser.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
+                        help='mfac batch size override (default: None)')
 
     # Optimizer parameters
     parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
@@ -331,24 +312,14 @@ def parse_args():
                         help='convert model torchscript for inference')
     parser.add_argument('--fuser', default='', type=str,
                         help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
+    parser.add_argument('--grad-checkpointing', action='store_true', default=False,
+                        help='Enable gradient checkpointing through model blocks/stages')
+
+    # Logging args
     parser.add_argument('--log-wandb', action='store_true', default=False,
                         help='log training and validation metrics to wandb')
     parser.add_argument('--log-sparsity', action='store_true', default=False,
                         help='whether to log sparsity on each pruning step')
-
-    # CosineAnnealingWarmupRestarts args
-    parser.add_argument('--prune-start-epoch', type=int, default=125,
-                        help='start of pruning stage')
-    parser.add_argument('--prune-end-epoch', type=int, default=525,
-                        help='end of pruning stage')
-    parser.add_argument('--prune-frequency', type=int, default=25,
-                        help='pruning frequency')
-    parser.add_argument('--period-warmup', type=int, default=5,
-                        help='warmup epochs after each AC/DC stage')
-    parser.add_argument('--lr-even-mult', type=float, default=1.0,
-                        help='end of pruning stage')
-    parser.add_argument('--lr-odd-mult', type=float, default=1.0,
-                        help='end of pruning stage')
 
     # AdaPrune calibration images args
     parser.add_argument('--load-calibration-images', action='store_true',
@@ -358,10 +329,14 @@ def parse_args():
     parser.add_argument('--path-to-labels', default='./data/imagenet_train_labels.npy', type=str, 
                         help='path-to-imagenet-labels')
 
+    # Whether to save last model
+    parser.add_argument('--save-last', action='store_true', default=False,
+                        help='Whether to save the last state of the model')
     
     config_args, remaining_args = config_parser.parse_known_args()
     # Do we have a config file to parse?
     args = parser.parse_known_args()
+    # If there is config replace default 
     if config_args.config:
         with open(config_args.config, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -377,62 +352,40 @@ def parse_args():
 
 
 def main():
+    # torch to benchmark mode
+    torch.backends.cudnn.benchmark = True
+    # setup logging
+    _logger = logging.getLogger('train')
     setup_default_logging()
     # parse args
     args, args_text = parse_args()
-             
-    # init distributed training
-    args.prefetcher = not args.no_prefetcher
-    args.distributed = False
-    if 'WORLD_SIZE' in os.environ:
-        args.distributed = int(os.environ['WORLD_SIZE']) > 1
-    args.device = 'cuda:0'
-    args.world_size = 1
-    args.rank = 0  # global rank
-    if args.distributed:
-        args.device = 'cuda:%d' % args.local_rank
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
-        args.world_size = torch.distributed.get_world_size()
-        args.rank = torch.distributed.get_rank()
-        _logger.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
-                     % (args.rank, args.world_size))
-    else:
-        _logger.info('Training with a single process on 1 GPUs.')
-    assert args.rank >= 0
+    init_distributed_mode(args, _logger)
 
     if args.log_wandb:
         if has_wandb and args.rank == 0:
+
             wandb.init(
                 project=f"SparseTraining|{args.model}", 
-                name=f"{args.model}/{args.experiment}",
+                name=f"{args.experiment}",
                 config=args
             )
     else: 
-        _logger.warning("You've requested to log metrics to wandb but package not found. "
-                            "Metrics not being logged to wandb, try `pip install wandb`")
+        if args.rank == 0:
+            _logger.warning(
+                colorama.Fore.RED + \
+                "You've requested to log metrics to wandb but package not found. "
+                "Metrics not being logged to wandb, try `pip install wandb`" + \
+                colorama.Fore.RESET
+            )
 
-    # resolve AMP arguments based on PyTorch / Apex availability
-    use_amp = None
-    if args.amp:
-        # `--amp` chooses native amp before apex (APEX ver not actively maintained)
-        if has_native_amp:
-            args.native_amp = True
-        elif has_apex:
-            args.apex_amp = True
-    if args.apex_amp and has_apex:
-        use_amp = 'apex'
-    elif args.native_amp and has_native_amp:
-        use_amp = 'native'
-    elif args.apex_amp or args.native_amp:
-        _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
-                        "Install NVIDA apex or upgrade to PyTorch 1.6")
-
+    use_amp = init_amp_mode(args, _logger)
+    # seed everthing
     random_seed(args.seed, args.rank)
 
     if args.fuser:
         set_jit_fuser(args.fuser)
 
+    # create model
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -445,16 +398,24 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
-        checkpoint_path=args.initial_checkpoint)
+        checkpoint_path=args.initial_checkpoint
+    )
+
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
 
+    if args.grad_checkpointing:
+        model.set_grad_checkpointing(enable=True)
+
     if args.local_rank == 0:
         _logger.info(
-            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
+            colorama.Fore.GREEN + \
+            f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}' + \
+            colorama.Fore.RESET
+        )
 
-    data_config = resolve_data_config(vars(args), model=model, verbose=args.local_rank == 0)
+    data_config = resolve_data_config(vars(args), model=model, verbose=args.rank == 0)
 
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
@@ -468,14 +429,15 @@ def main():
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
 
     # move model to GPU, enable channels last layout if set
-    model.cuda()
+    model.to(args.device)
     if args.channels_last:
         model = model.to(memory_format=torch.channels_last)
 
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
         assert not args.split_bn
-        if has_apex and use_amp == 'apex':
+        if use_amp == 'apex':
+            from apex.parallel import convert_syncbn_model
             # Apex SyncBN preferred unless native amp is activated
             model = convert_syncbn_model(model)
         else:
@@ -498,101 +460,67 @@ def main():
         optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
-    amp_autocast = suppress  # do nothing
-    loss_scaler = None
-    if use_amp == 'apex':
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        loss_scaler = ApexScaler()
-        if args.local_rank == 0:
-            _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
-    elif use_amp == 'native':
-        amp_autocast = torch.cuda.amp.autocast
-        loss_scaler = NativeScaler()
-        if args.local_rank == 0:
-            _logger.info('Using native Torch AMP. Training in mixed precision.')
-    else:
-        if args.local_rank == 0:
-            _logger.info('AMP not enabled. Training in float32.')
-
+    loss_scaler, amp_autocast = setup_amp(model, optimizer, args, _logger)
     # optionally resume from a checkpoint
     resume_epoch = None
     if args.resume:
         # load model checkpoint
         load_model(args.resume, model, fix_data_parallel=True)
-        if args.local_rank == 0:
+        if args.rank == 0:
             _logger.info(f'Loading model from checkpoint {args.resume}')
         # load optimizer
         if not args.no_resume_opt:
-            if args.local_rank == 0:
+            if args.rank == 0:
                 _logger.info(f'Loading optimizer from checkpoint {args.resume}')
             load_optimizer(args.resume, optimizer, map_location=args.device)
+            load_loss_scaler(args.resume, loss_scaler, map_location=args.device)
         resume_epoch = load_epoch(args.resume, map_location=args.device)
-        if args.local_rank == 0:
+        if args.rank == 0:
             _logger.info(f'Starting training from {resume_epoch} epoch')
 
     # setup exponential moving average of model weights, SWA could be used here too
     model_ema = None
     if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
+        # Important to create EMA model after cuda(), DP wrapper, and AMP but before DDP wrapper
         model_ema = ModelEmaV2(
             model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
+        # do not resume EMA
 
-    # setup distributed training
-    if args.distributed:
-        if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
-            if args.local_rank == 0:
-                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
-        else:
-            if args.local_rank == 0:
-                _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
-        # NOTE: EMA model does not need to be wrapped by DDP
+    setup_distributed(model, args, _logger)
 
-    # setup learning rate schedule and starting epoch
-    if args.sched == 'cosine_sparse':
-        lr_schedule_fn = CosineAnnealingWarmupRestarts(
-            start_epoch=args.prune_start_epoch, 
-            end_epoch=args.prune_end_epoch, 
-            T_max=args.epochs,
-            update_frequency=args.prune_frequency,
-            init_warmup=args.warmup,
-            period_warmup=args.period_warmup, 
-            warmup_lr_mult=args.min_lr / args.lr,
-            min_lr_mult=args.warmup_lr / args.lr, 
-            lr_even_mult=args.lr_even_mult,
-            lr_odd_mult=args.lr_odd_mult
-        )
-        lr_scheduler, num_epochs = \
-            torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn, last_epoch=args.start_epoch), args.epochs
-    else:
-        lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
     start_epoch = 0
     if args.start_epoch is not None:
         # a specified start_epoch will always override the resume epoch
         start_epoch = args.start_epoch
     elif resume_epoch is not None:
         start_epoch = resume_epoch
-    if args.sched != 'cosine_sparse':
-        if lr_scheduler is not None and start_epoch > 0:
+    if lr_scheduler is not None and start_epoch > 0:
             lr_scheduler.step(start_epoch)
 
-    if args.local_rank == 0:
-        _logger.info('Scheduled epochs: {}'.format(num_epochs))
-
     # create the train and eval datasets
-    dataset_train = create_dataset(
-        args.dataset, root=args.data_dir, split=args.train_split, is_training=True,
+    args.prefetcher = not args.no_prefetcher
+
+    train_dataset = create_dataset(
+        args.dataset, 
+        root=args.data_dir, 
+        split=args.train_split, 
+        is_training=True,
         class_map=args.class_map,
         download=args.dataset_download,
         batch_size=args.batch_size,
-        repeats=args.epoch_repeats)
-    dataset_eval = create_dataset(
-        args.dataset, root=args.data_dir, split=args.val_split, is_training=False,
+        repeats=args.epoch_repeats
+    )
+
+    eval_dataset = create_dataset(
+        args.dataset, 
+        root=args.data_dir, 
+        split=args.val_split, 
+        is_training=False,
         class_map=args.class_map,
         download=args.dataset_download,
-        batch_size=args.batch_size)
+        batch_size=args.batch_size
+    )
 
     # setup mixup / cutmix
     collate_fn = None
@@ -602,7 +530,8 @@ def main():
         mixup_args = dict(
             mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.num_classes)
+            label_smoothing=args.smoothing, num_classes=args.num_classes
+        )
         if args.prefetcher:
             assert not num_aug_splits  # collate conflict (need to support deinterleaving in collate mixup)
             collate_fn = FastCollateMixup(**mixup_args)
@@ -611,14 +540,15 @@ def main():
 
     # wrap dataset in AugMix helper
     if num_aug_splits > 1:
-        dataset_train = AugMixDataset(dataset_train, num_splits=num_aug_splits)
+        train_dataset = AugMixDataset(train_dataset, num_splits=num_aug_splits)
 
     # create data loaders w/ augmentation pipeiine
     train_interpolation = args.train_interpolation
     if args.no_aug or not train_interpolation:
         train_interpolation = data_config['interpolation']
-    loader_train = create_loader(
-        dataset_train,
+
+    train_loader = create_loader(
+        train_dataset,
         input_size=data_config['input_size'],
         batch_size=args.batch_size,
         is_training=True,
@@ -644,11 +574,11 @@ def main():
         collate_fn=collate_fn,
         pin_memory=args.pin_mem,
         use_multi_epochs_loader=args.use_multi_epochs_loader,
-        worker_seeding=args.worker_seeding,
+        worker_seeding=args.worker_seeding
     )
 
-    loader_eval = create_loader(
-        dataset_eval,
+    eval_loader = create_loader(
+        eval_dataset,
         input_size=data_config['input_size'],
         batch_size=args.validation_batch_size or args.batch_size,
         is_training=False,
@@ -659,45 +589,31 @@ def main():
         num_workers=args.workers,
         distributed=args.distributed,
         crop_pct=data_config['crop_pct'],
-        pin_memory=args.pin_mem,
+        pin_memory=args.pin_mem
     )
 
     # make separate MFAC-loader
     if args.mfac_loader:
         loader_mfac = create_loader(
-            dataset_train,
+            train_dataset,
             input_size=data_config['input_size'],
             batch_size=args.mfac_batch_size,
             is_training=True,
             use_prefetcher=args.prefetcher,
-            no_aug=args.no_aug,
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            re_split=args.resplit,
-            scale=args.scale,
-            ratio=args.ratio,
-            hflip=args.hflip,
-            vflip=args.vflip,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            num_aug_repeats=args.aug_repeats,
-            num_aug_splits=num_aug_splits,
-            interpolation=train_interpolation,
+            interpolation=data_config['interpolation'],
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
-            distributed=False,
-            collate_fn=collate_fn,
-            pin_memory=args.pin_mem,
-            use_multi_epochs_loader=args.use_multi_epochs_loader,
-            worker_seeding=args.worker_seeding,
+            distributed=args.distributed,
+            crop_pct=data_config['crop_pct'],
+            pin_memory=args.pin_mem
         )
 
-        def mfac_data_generator():
-            for input, target in loader_mfac:
-                input, target = input.to(args.device), target.to(args.device)
-                yield [input], {}, target
+        def mfac_data_generator(device=args.device):
+            while True:
+                for input, target in loader_mfac:
+                    input, target = input.to(device), target.to(device)
+                    yield [input], {}, target
 
     # setup loss function
     if args.jsd_loss:
@@ -717,11 +633,11 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.cuda()
-    validate_loss_fn = nn.CrossEntropyLoss().cuda()
+    val_loss_fn = nn.CrossEntropyLoss().cuda()
 
     if args.mfac_loader:
         # create grad sampler with the created data laoder and loss function
-        grad_sampler = GradSampler(mfac_data_generator(), train_loss_fn)
+        grad_sampler = GradSampler(mfac_data_generator(), val_loss_fn)
 
     #########################
     # Setup SparseML manager
@@ -730,43 +646,48 @@ def main():
     bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
     # prepare calibration images (if AdaPrune used)
     if args.load_calibration_images:
-        if args.local_rank == 0:
-            _logger.info(f"Collecting {args.num_calibration_images} for AdaPrune")
-        train_ids_all = range(len(dataset_train))
-        train_labels_all = np.load(args.path_to_labels)
-        train_ids, _, train_labels, _ =  train_test_split(
-            train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
-        calibration_images = torch.stack(
-            [torch.tensor(dataset_train[i][0], device=args.device, dtype=torch.float32) for i in train_ids], dim=0)
+        calibration_images = load_calibration_images(train_dataset, args, _logger)
         bonus_kw['calibration_images'] = calibration_images
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
     # wrap optimizer  
     optimizer = manager.modify(
-        model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, distillation_teacher='self', **bonus_kw) 
+        model, 
+        optimizer, 
+        steps_per_epoch=len(train_loader), 
+        epoch=start_epoch, 
+        distillation_teacher='self', 
+        **bonus_kw
+    ) 
+    
     # override timm scheduler
     if any("LearningRate" in str(modifier) for modifier in manager.modifiers):
         lr_scheduler = None
         if manager.max_epochs:   
             num_epochs = manager.max_epochs
-        if args.local_rank == 0:
-            _logger.info("Disabling timm LR scheduler, managing LR using SparseML recipe")
-            _logger.info(f"Overriding max_epochs to {num_epochs} from SparseML recipe")
+        if args.rank == 0:
+            _logger.info(
+                colorama.Fore.YELLOW + \
+                "Disabling timm LR scheduler, managing LR using SparseML recipe" + \
+                colorama.Fore.RESET
+            )
+            _logger.info(
+                colorama.Fore.YELLOW + \
+                f"Overriding max_epochs to {num_epochs} from SparseML recipe" + \
+                colorama.Fore.RESET
+            )
+    else:
+        if args.rank == 0:
+            _logger.info(f'Scheduled epochs: {num_epochs}')
 
     # setup checkpoint saver and eval metric tracking
     eval_metric = args.eval_metric
-    best_metric_dense, best_metric_sparse = 0.0, 0.0
-    best_epoch_dense, best_epoch_sparse = None, None
+    best_metric_dense  = 0.0
+    best_metric_sparse = 0.0
     output_dir = None
     if args.rank == 0:
-        if args.experiment:
-            exp_name = args.experiment
-        else:
-            exp_name = '-'.join([
-                datetime.now().strftime("%Y%m%d-%H%M%S"),
-                safe_model_name(args.model),
-                str(data_config['input_size'][-1])
-            ])
+        assert args.experiment is not None, "One needs to set the name of experiment"
+        exp_name = args.experiment
         output_dir = get_outdir(args.output if args.output else './output/train', exp_name)
         decreasing = True if eval_metric == 'loss' else False
 
@@ -775,13 +696,23 @@ def main():
 
     try:
         for epoch in range(start_epoch, num_epochs):
-            if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
-                loader_train.sampler.set_epoch(epoch)
+            if args.distributed and hasattr(train_loader.sampler, 'set_epoch'):
+                train_loader.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
-                epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, output_dir=output_dir, amp_autocast=amp_autocast, 
-                loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn
+                epoch, 
+                model, 
+                train_loader, 
+                optimizer, 
+                train_loss_fn, 
+                args,
+                _logger,
+                lr_scheduler=lr_scheduler, 
+                output_dir=output_dir, 
+                amp_autocast=amp_autocast, 
+                loss_scaler=loss_scaler,
+                model_ema=model_ema, 
+                mixup_fn=mixup_fn
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -789,21 +720,33 @@ def main():
                     _logger.info("Distributing BatchNorm running means and vars")
                 distribute_bn(model, args.world_size, args.dist_bn == 'reduce')
 
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+            eval_metrics = valid_one_epoch(
+                model, 
+                eval_loader, 
+                val_loss_fn, 
+                args, 
+                _logger,
+                amp_autocast=amp_autocast
+            )
 
-            # get current mean sparsity
-            mean_sparsity = get_current_sparsity(manager, epoch)
+            # get current average sparsity
+            avg_sparsity = get_current_sparsity(manager, epoch)
             # evaluate EMA
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
                     distribute_bn(model_ema, args.world_size, args.dist_bn == 'reduce')
                 # do not evaluate EMA if in sparse stage
-                if mean_sparsity == 0.0:
-                    ema_eval_metrics = validate(
-                        model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
+                if avg_sparsity == 0.0:
+                    ema_eval_metrics = valid_one_epoch(
+                        model_ema.module, 
+                        eval_loader, 
+                        val_loss_fn, 
+                        args, 
+                        _logger,
+                        amp_autocast=amp_autocast, 
+                        log_suffix=' (EMA)'
+                    )
                     eval_metrics = ema_eval_metrics
-            # add mean sparsity to logged dict
-            eval_metrics['sparsity'] = mean_sparsity
 
             if lr_scheduler is not None:
                 if args.sched == 'cosine_annealing':
@@ -813,9 +756,14 @@ def main():
                     lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
             if output_dir is not None:
-                update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric_dense is None, log_wandb=args.log_wandb and has_wandb
+                log_on_epoch(
+                    epoch, 
+                    train_metrics, 
+                    eval_metrics, 
+                    filename=f'{output_dir}/summary.csv',
+                    sparsity=avg_sparsity,
+                    log_wandb=args.log_wandb,
+                    write_header=(epoch == start_epoch)
                 )
 
             if args.local_rank == 0:
@@ -824,13 +772,14 @@ def main():
                         path=f'{output_dir}/{args.model}_epoch={epoch}.pth',
                         model=model, 
                         optimizer=optimizer, 
+                        loss_scaler=loss_scaler,
                         epoch=epoch,
                         use_zipfile_serialization_if_available=True,
                         include_modifiers=True
                     )
 
                 # log mean sparsity
-                _logger.info(f'Mean sparsity: {mean_sparsity:.4f}')
+                _logger.info(f'Mean sparsity: {avg_sparsity:.4f}')
 
                 if args.log_sparsity and is_update_epoch(manager, epoch):
                     sparsity_info = json.loads(get_sparsity_info(model))
@@ -838,13 +787,14 @@ def main():
                         json.dump(sparsity_info, outfile)
 
                 # save best sparse checkpoint
-                if mean_sparsity > 0.0 and eval_metrics[eval_metric] > best_metric_sparse:
+                if avg_sparsity > 0.0 and eval_metrics[eval_metric] > best_metric_sparse:
                     best_metric_sparse = eval_metrics[eval_metric]
                     best_epoch_sparse = epoch
                     save_model(
                         path=f'{output_dir}/{args.model}_sparse_best.pth',
                         model=model, 
-                        optimizer=optimizer, 
+                        optimizer=optimizer,
+                        loss_scaler=loss_scaler, 
                         epoch=epoch,
                         use_zipfile_serialization_if_available=True,
                         include_modifiers=True
@@ -852,214 +802,42 @@ def main():
                     _logger.info(f'New best sparse model on epoch {epoch} with accuracy {best_metric_sparse:.4f}')
 
                 # save best dense checkpoint
-                if mean_sparsity == 0.0 and eval_metrics[eval_metric] > best_metric_dense:
+                if avg_sparsity == 0.0 and eval_metrics[eval_metric] > best_metric_dense:
                     best_metric_dense = eval_metrics[eval_metric]
                     best_epoch_dense = epoch
                     save_model(
                         path=f'{output_dir}/{args.model}_dense_best.pth',
                         model=model, 
                         optimizer=optimizer, 
+                        loss_scaler=loss_scaler,
                         epoch=epoch,
                         use_zipfile_serialization_if_available=True,
                         include_modifiers=True
                     )
                     _logger.info(f'New best dense model on epoch {epoch} with accuracy {best_metric_dense:.4f}')
-
     except KeyboardInterrupt:
         pass
-    if best_metric_dense > 0.0:
+    if best_metric_dense > 0.0 and args.local_rank == 0:
         _logger.info('*** Best metric (dense): {0} (epoch {1})'.format(best_metric_dense, best_epoch_dense))
-    if best_metric_sparse > 0.0:
-        _logger.info('*** Best metric (sparse): {0} (epoch {1})'.format(best_metric_sparse, best_epoch_sparse))        
+    if best_metric_sparse > 0.0 and args.local_rank == 0:
+        _logger.info('*** Best metric (sparse): {0} (epoch {1})'.format(best_metric_sparse, best_epoch_sparse))
+
+    # save last (if requested)
+    if args.save_last and args.local_rank == 0:
+        save_model(
+            path=f'{output_dir}/{args.model}_last.pth',
+            model=model, 
+            optimizer=optimizer, 
+            loss_scaler=loss_scaler,
+            epoch=epoch,
+            use_zipfile_serialization_if_available=True,
+            include_modifiers=True
+        )    
+        _logger.info(f'Saved last training state of the model')
 
     # finalize pruner
     manager.finalize(model)
 
-
-def train_one_epoch(
-        epoch, model, loader, optimizer, loss_fn, args,
-        lr_scheduler=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None):
     
-    # define closure for SAM
-    def closure():
-        loss = loss_fn(model(input), target)
-        loss.backward()
-        return loss
-
-    if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
-        if args.prefetcher and loader.mixup_enabled:
-            loader.mixup_enabled = False
-        elif mixup_fn is not None:
-            mixup_fn.mixup_enabled = False
-
-    second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()
-    losses_m = AverageMeter()
-
-    model.train()
-
-    end = time.time()
-    last_idx = len(loader) - 1
-    num_updates = epoch * len(loader)
-    for batch_idx, (input, target) in enumerate(loader):
-        last_batch = batch_idx == last_idx
-        data_time_m.update(time.time() - end)
-        if not args.prefetcher:
-            input, target = input.cuda(), target.cuda()
-            if mixup_fn is not None:
-                input, target = mixup_fn(input, target)
-        if args.channels_last:
-            input = input.contiguous(memory_format=torch.channels_last)
-
-        # turn of batch norm stats if needed
-        if args.sam:
-            enable_running_stats(model)
-
-        with amp_autocast():
-            output = model(input)
-            loss = loss_fn(output, target)
-
-        if not args.distributed:
-            losses_m.update(loss.item(), input.size(0))
-
-        optimizer.zero_grad()
-        if loss_scaler is not None:
-            loss_scaler(
-                loss, optimizer,
-                clip_grad=args.clip_grad, clip_mode=args.clip_mode,
-                parameters=model_parameters(model, exclude_head='agc' in args.clip_mode),
-                create_graph=second_order)
-        else:
-            sync_context = model.no_sync() if args.sam else nullcontext
-            with sync_context:
-                loss.backward(create_graph=second_order)
-                if args.clip_grad is not None:
-                    dispatch_clip_grad(
-                        model_parameters(model, exclude_head='agc' in args.clip_mode),
-                        value=args.clip_grad, mode=args.clip_mode)
-
-            if args.sam:
-                disable_running_stats(model)
-                optimizer.step(closure)
-            else:
-                optimizer.step()
-
-        if model_ema is not None:
-            model_ema.update(model)
-
-        torch.cuda.synchronize()
-        num_updates += 1
-        batch_time_m.update(time.time() - end)
-        if last_batch or batch_idx % args.log_interval == 0:
-            lrl = [param_group['lr'] for param_group in optimizer.param_groups]
-            lr = sum(lrl) / len(lrl)
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                losses_m.update(reduced_loss.item(), input.size(0))
-
-            if args.local_rank == 0:
-                _logger.info(
-                    'Train: {} [{:>4d}/{} ({:>3.0f}%)]  '
-                    'Loss: {loss.val:#.4g} ({loss.avg:#.3g})  '
-                    'Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  '
-                    '({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'LR: {lr:.3e}  '
-                    'Data: {data_time.val:.3f} ({data_time.avg:.3f})'.format(
-                        epoch,
-                        batch_idx, len(loader),
-                        100. * batch_idx / last_idx,
-                        loss=losses_m,
-                        batch_time=batch_time_m,
-                        rate=input.size(0) * args.world_size / batch_time_m.val,
-                        rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
-                        lr=lr,
-                        data_time=data_time_m))
-
-                if args.save_images and output_dir:
-                    torchvision.utils.save_image(
-                        input,
-                        os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
-                        padding=0,
-                        normalize=True)
-
-        if lr_scheduler is not None and args.sched != 'cosine_sparse':
-            lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
-
-        end = time.time()
-        # end for
-
-    if hasattr(optimizer, 'sync_lookahead'):
-        optimizer.sync_lookahead()
-
-    return OrderedDict([('loss', losses_m.avg)])
-
-
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
-    batch_time_m = AverageMeter()
-    losses_m = AverageMeter()
-    top1_m = AverageMeter()
-    top5_m = AverageMeter()
-
-    model.eval()
-
-    end = time.time()
-    last_idx = len(loader) - 1
-    with torch.no_grad():
-        for batch_idx, (input, target) in enumerate(loader):
-            last_batch = batch_idx == last_idx
-            if not args.prefetcher:
-                input = input.cuda()
-                target = target.cuda()
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-
-            with amp_autocast():
-                output = model(input)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-
-            # augmentation reduction
-            reduce_factor = args.tta
-            if reduce_factor > 1:
-                output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
-                target = target[0:target.size(0):reduce_factor]
-
-            loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-
-            if args.distributed:
-                reduced_loss = reduce_tensor(loss.data, args.world_size)
-                acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
-            else:
-                reduced_loss = loss.data
-
-            torch.cuda.synchronize()
-
-            losses_m.update(reduced_loss.item(), input.size(0))
-            top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
-
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            if args.local_rank == 0 and (last_batch or batch_idx % args.log_interval == 0):
-                log_name = 'Test' + log_suffix
-                _logger.info(
-                    '{0}: [{1:>4d}/{2}]  '
-                    'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
-                        log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
-
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
-
-    return metrics
-
-
 if __name__ == '__main__':
     main()

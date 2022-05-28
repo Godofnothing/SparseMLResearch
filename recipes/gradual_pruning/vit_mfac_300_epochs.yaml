@@ -8,17 +8,17 @@ training_modifiers:
     start_epoch: 0
     end_epoch: 200
     lr_func: cyclic_linear
-    init_lr: 0.0001
-    final_lr: 0.000001
-    cycle_epochs: 5.0   
+    init_lr: 0.0005
+    final_lr: 0.000005
+    cycle_epochs: 20 
 
   - !LearningRateFunctionModifier
     start_epoch: 200
     end_epoch: 300
     lr_func: cosine
-    init_lr: 0.0001
-    final_lr: 0.00001
-  
+    init_lr: 0.0005
+    final_lr: 0.000001
+    
 pruning_modifiers:
     
  - !MFACPruningModifier
@@ -27,7 +27,7 @@ pruning_modifiers:
     final_sparsity: 0.6
     start_epoch: 0.0
     end_epoch: 200.0
-    update_frequency: 5
+    update_frequency: 20
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     leave_enabled: True
     mask_type: unstructured

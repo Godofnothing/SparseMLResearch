@@ -1,6 +1,6 @@
 pruning_modifiers:
 
-  - !GlobalMagnitudePruningModifier
+  - !MagnitudePruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
     init_sparsity: 0.5
     final_sparsity: 0.5
