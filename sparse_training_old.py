@@ -137,11 +137,9 @@ def parse_args():
                         help='input batch size for training (default: 128)')
     parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                         help='validation batch size override (default: None)')
-    parser.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
-                        help='mfac batch size override (default: None)')
-    parser.add_argument('--mfac-loader', action='store_true',
-                        help='whether to use separate loader for MFAC (default: False)')
-    
+    parser.add_argument('--grad-sampler-batch-size', type=int, default=None, metavar='N',
+                        help='mfac/obs batch size override (default: None)')
+
 
     # Optimizer parameters
     parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
@@ -666,29 +664,6 @@ def main():
         pin_memory=args.pin_mem,
     )
 
-    # make separate MFAC-loader
-    if args.mfac_loader:
-        loader_mfac = create_loader(
-            dataset_train,
-            input_size=data_config['input_size'],
-            batch_size=args.mfac_batch_size,
-            is_training=True,
-            use_prefetcher=args.prefetcher,
-            interpolation=data_config['interpolation'],
-            mean=data_config['mean'],
-            std=data_config['std'],
-            num_workers=args.workers,
-            distributed=args.distributed,
-            crop_pct=data_config['crop_pct'],
-            pin_memory=args.pin_mem
-        )
-
-        def mfac_data_generator(device=args.device):
-            while True:
-                for input, target in loader_mfac:
-                    input, target = input.to(device), target.to(device)
-                    yield [input], {}, target
-
     # setup loss function
     if args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
@@ -709,15 +684,10 @@ def main():
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
-    if args.mfac_loader:
-        # create grad sampler with the created data laoder and loss function
-        grad_sampler = GradSampler(mfac_data_generator(), validate_loss_fn)
-
     #########################
     # Setup SparseML manager
     ############$############
-
-    bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
+    bonus_kw = {}  # for SparseML manager init
     # prepare calibration images (if AdaPrune used)
     if args.load_calibration_images:
         if args.local_rank == 0:
@@ -731,7 +701,61 @@ def main():
         bonus_kw['calibration_images'] = calibration_images
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
-    # wrap optimizer  
+
+    # === initialize stuff for pruners ===
+    if any("MFACPruningModifier" in str(mod) for mod in manager.modifiers):
+        loader_mfac = create_loader(
+            dataset_train,
+            input_size=data_config['input_size'],
+            batch_size=args.grad_sampler_batch_size,
+            is_training=True,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            crop_pct=data_config['crop_pct'],
+            pin_memory=args.pin_mem
+        )
+        def mfac_data_generator(device=args.device):
+            while True:
+                for input, target in loader_mfac:
+                    input, target = input.to(device), target.to(device)
+                    yield [input], {}, target
+
+        grad_sampler = GradSampler(mfac_data_generator(), validate_loss_fn)
+        bonus_kw['grad_sampler'] = grad_sampler
+    elif any("OBSPruningModifier" in str(mod) for mod in manager.modifiers):
+        def data_loader_builder(kwargs):
+            # kwargs not yet used; --grad-sampler-batch-size should be used
+            loader_obs = create_loader(
+                dataset_train,
+                input_size=data_config['input_size'],
+                batch_size=args.grad_sampler_batch_size,
+                is_training=True,
+                use_prefetcher=args.prefetcher,
+                interpolation=data_config['interpolation'],
+                mean=data_config['mean'],
+                std=data_config['std'],
+                num_workers=args.workers,
+                distributed=args.distributed,
+                crop_pct=data_config['crop_pct'],
+                pin_memory=args.pin_mem
+            )
+            while True:
+                for input, target in loader_obs:
+                    input, target = input.to('cuda:0'), target.to('cuda:0')
+                    yield [input], {}, target
+        bonus_kw['grad_sampler'] = {
+            'data_loader_builder': data_loader_builder,
+            'loss_function': validate_loss_fn,
+        }
+    else:
+        print(f"No gradient based pruners initialized")
+    # === end pruner stuff ===
+
+    # wrap optimizer
     optimizer = manager.modify(
         model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, distillation_teacher='self', **bonus_kw) 
     # override timm scheduler
