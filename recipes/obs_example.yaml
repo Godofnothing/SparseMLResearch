@@ -1,0 +1,19 @@
+pruning_modifiers:
+ - !OBSPruningModifier
+    params: [
+      "re:blocks.*.attn.qkv.weight",
+      "re:blocks.*.attn.proj.weight",
+      "re:blocks.*.mlp.fc1.weight",
+      "re:blocks.*.mlp.fc2.weight",
+    ]
+    init_sparsity: 0.5
+    final_sparsity: 0.5
+    start_epoch: 0
+    end_epoch: 1
+    update_frequency: 1.0
+    inter_func: cubic
+    global_sparsity: True
+    mask_type: unstructured
+    num_grads: 50
+    damp: 1e-7
+    fisher_block_size: 50
