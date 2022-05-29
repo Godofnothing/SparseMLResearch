@@ -28,7 +28,6 @@ pruning_modifiers:
     start_epoch: 0.0
     end_epoch: 200.0
     update_frequency: 20
-    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     leave_enabled: True
     mask_type: unstructured
     global_sparsity : True
@@ -44,7 +43,6 @@ pruning_modifiers:
     start_epoch: 200.0
     end_epoch: 300.0
     update_frequency: 100
-    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)'] 
     leave_enabled: True
     mask_type: unstructured
     global_sparsity : True
