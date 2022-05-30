@@ -1,32 +1,20 @@
 #!/bin/bash
 
-#SBATCH --job-name SparseML
-#SBATCH --partition gpu
-#SBATCH --nodes 1
-#SBATCH --gpus 4
-#SBATCH --cpus-per-task 16
-#SBATCH --time 24:00:00 # hh:mm:ss, walltime
-#SBATCH --mem 160G
-#SBATCH -w gn12
-
-source /home/${USER}/.bashrc
-source activate pysparse
-
-NUM_PROC=4
+NUM_PROC=2
 MASTER_PORT=29501
 
 MODEL=deit_tiny_patch16_224 
-EXP=GPshort_GM_50_ep_${MODEL}_lr=1e-5
+EXP=GPshort_OBS_50_ep_${MODEL}_lr=1e-4
 
 python -m torch.distributed.launch \
     --nproc_per_node=${NUM_PROC} \
     --master_port=${MASTER_PORT} \
     sparse_training_old.py \
     \
-    /gpfs/gpfs0/datasets/ImageNet/ILSVRC2012 \
+    /nvmedisk/Datasets/ILSVRC/Data/CLS-LOC \
     \
     --config configs/deit_old.yaml \
-    --sparseml-recipe recipes/gradual_pruning_short/vit_gm_50_epochs_lr_max=1e-5.yaml \
+    --sparseml-recipe recipes/gradual_pruning_short/vit_obs_50_epochs_sp=0.6_lr=1e-4.yaml \
     \
     --dataset imagenet \
     \
@@ -43,7 +31,6 @@ python -m torch.distributed.launch \
     --mfac-batch-size 256 \
     \
     --log-sparsity \
-    --log-wandb \
     \
     --amp \
     \

@@ -678,12 +678,12 @@ def main():
             mean=data_config['mean'],
             std=data_config['std'],
             num_workers=args.workers,
-            distributed=args.distributed,
+            distributed=False,
             crop_pct=data_config['crop_pct'],
             pin_memory=args.pin_mem
         )
 
-        def mfac_data_generator(device=args.device):
+        def mfac_data_generator(device=args.device, **kwargs):
             while True:
                 for input, target in loader_mfac:
                     input, target = input.to(device), target.to(device)
@@ -709,15 +709,21 @@ def main():
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
 
-    if args.mfac_loader:
-        # create grad sampler with the created data laoder and loss function
-        grad_sampler = GradSampler(mfac_data_generator(), validate_loss_fn)
+    # if args.mfac_loader:
+    #     # create grad sampler with the created data laoder and loss function
+    #     grad_sampler = GradSampler(mfac_data_generator(), train_loss_fn)
 
     #########################
     # Setup SparseML manager
     ############$############
 
-    bonus_kw = {'grad_sampler' : grad_sampler} if args.mfac_loader else {}
+    bonus_kw = {
+        'grad_sampler' : {
+            'data_loader_builder' : mfac_data_generator,
+            'loss_function' : validate_loss_fn
+        }
+    } if args.mfac_loader else {}
+        
     # prepare calibration images (if AdaPrune used)
     if args.load_calibration_images:
         if args.local_rank == 0:
@@ -733,7 +739,13 @@ def main():
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
     # wrap optimizer  
     optimizer = manager.modify(
-        model, optimizer, steps_per_epoch=len(loader_train), epoch=start_epoch, distillation_teacher='self', **bonus_kw) 
+        model, 
+        optimizer, 
+        steps_per_epoch=len(loader_train), 
+        epoch=start_epoch, 
+        distillation_teacher='self', 
+        **bonus_kw
+    ) 
     # override timm scheduler
     if any("LearningRate" in str(modifier) for modifier in manager.modifiers):
         lr_scheduler = None
