@@ -26,12 +26,12 @@ def parse_args():
     parser = argparse.ArgumentParser('One shot pruning with AdaPrune finetuning.', add_help=False)
     # Model
     parser.add_argument('--model', default='deit_small_patch16_224', type=str)
+    # Experiment
+    parser.add_argument('--experiment', default='', type=str)
     # Path to data
     parser.add_argument('--data-dir', required=True, type=str)
     # Path to recipe
     parser.add_argument('--sparseml-recipe', required=True, type=str)
-    # Features
-    parser.add_argument('--module-regex', required=True, type=str)
     # Loader params
     parser.add_argument('-b', '--batch_size', default=128, type=int)
     parser.add_argument('-vb', '--val_batch_size', default=128, type=int)
@@ -40,6 +40,7 @@ def parse_args():
     # Sparsities
     parser.add_argument('--sparsities', nargs='+', required=True, type=float)
     # AdaPrune params
+    parser.add_argument('--load-calibration-images', action='store_true')
     parser.add_argument('--num-calibration-images', default=1000, type=int)
     # Path to imagenet labels
     parser.add_argument('--path-to-labels', required=True, type=str)
@@ -66,7 +67,7 @@ if __name__ == '__main__':
         wandb.init(
             project="ImageNetOneShotPruning", 
             entity="spiridon_sun_rotator",
-            name=f"AdaPrune/{args.model}",
+            name=f"OneShotPruning/{args.model}/{args.experiment}",
             config={
                 "model" : args.model,
                 "dataset" : "ImageNet",
@@ -113,25 +114,27 @@ if __name__ == '__main__':
     )
 
     # prepare calibration images
-    train_ids_all = range(len(train_dataset))
-    train_labels_all = np.load(args.path_to_labels)
-    train_ids, _, train_labels, _ =  train_test_split(
-        train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
-    calibration_images = torch.stack([train_dataset[i][0] for i in train_ids], dim=0).to(device)
+    if args.load_calibration_images:
+        train_ids_all = range(len(train_dataset))
+        train_labels_all = np.load(args.path_to_labels)
+        train_ids, _, train_labels, _ =  train_test_split(
+            train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
+        calibration_images = torch.stack([train_dataset[i][0] for i in train_ids], dim=0).to(device)
 
     # define for M-FAC pruner
-    def mfac_data_generator():
-        for input, target in train_loader:
-            input, target = input.to(device), target.to(device)
-            yield [input], {}, target
+    def mfac_data_generator(**kwargs):
+        while True:
+            for input, target in train_loader:
+                input, target = input.to(device), target.to(device)
+                yield [input], {}, target
 
     # dummy loss 
-    criterion = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss()
     # model
     model = timm.create_model(args.model, pretrained=True)
     model = model.to(device)
     # first evaluation
-    val_acc = val_epoch(model, val_loader, criterion, device=device)['acc']
+    val_acc = val_epoch(model, val_loader, loss_fn, device=device)['acc']
     print(f'Accuracy dense: {val_acc:.3f}')
     # make dir (if needed)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -143,21 +146,21 @@ if __name__ == '__main__':
         model_sparse = deepcopy(model)
         # create sparseml manager
         manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
-        # create grad sampler
-        grad_sampler = GradSampler(mfac_data_generator(), criterion)
         # update manager
         manager.modifiers[0].init_sparsity  = sparsity
         manager.modifiers[0].final_sparsity = sparsity
         # apply recipe
-        manager.apply(
+        optimizer = manager.apply(
             model_sparse, 
-            epoch=0, 
-            grad_sampler=grad_sampler,
-            calibration_images=calibration_images,
-            teacher_model=model
+            grad_sampler={
+                'data_loader_builder' : mfac_data_generator,
+                'loss_function' : loss_fn,
+            },
+            teacher_model=model,
+            finalize=True
         )
         # evaluate after AdaPrune
-        val_acc = val_epoch(model_sparse, val_loader, criterion, device=device)['acc']
+        val_acc = val_epoch(model_sparse, val_loader, loss_fn, device=device)['acc']
         # update experiment data
         experiment_data['val/acc'].append(val_acc)
         print(f'Test accuracy: {val_acc:.3f}')

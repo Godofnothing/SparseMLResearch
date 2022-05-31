@@ -29,7 +29,7 @@ import torchvision.utils
 
 from collections import OrderedDict
 from contextlib import nullcontext, suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sklearn.model_selection import train_test_split
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
@@ -362,6 +362,9 @@ def parse_args():
     parser.add_argument('--save-last', action='store_true', default=False,
                         help='Whether to save the last state of the model')
 
+    # Worker timedelta
+    parser.add_argument('--timeout', type=int, default=1800,
+                        help='Worker timeout')
     
     config_args, remaining_args = config_parser.parse_known_args()
     # Do we have a config file to parse?
@@ -396,7 +399,11 @@ def main():
     if args.distributed:
         args.device = 'cuda:%d' % args.local_rank
         torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+        torch.distributed.init_process_group(
+            backend='nccl', 
+            init_method='env://', 
+            timeout=timedelta(seconds=args.timeout)
+        )
         args.world_size = torch.distributed.get_world_size()
         args.rank = torch.distributed.get_rank()
         _logger.info('Training in distributed mode with multiple processes, 1 GPU per process. Process %d, total %d.'
@@ -708,10 +715,6 @@ def main():
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.cuda()
     validate_loss_fn = nn.CrossEntropyLoss().cuda()
-
-    # if args.mfac_loader:
-    #     # create grad sampler with the created data laoder and loss function
-    #     grad_sampler = GradSampler(mfac_data_generator(), train_loss_fn)
 
     #########################
     # Setup SparseML manager

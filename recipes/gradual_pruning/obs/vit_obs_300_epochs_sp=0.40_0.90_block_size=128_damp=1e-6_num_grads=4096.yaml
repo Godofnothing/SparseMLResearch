@@ -1,0 +1,52 @@
+training_modifiers:
+
+  - !EpochRangeModifier
+    start_epoch: 0
+    end_epoch: 300
+  
+  - !LearningRateFunctionModifier
+    start_epoch: 0
+    end_epoch: 200
+    lr_func: cyclic_linear
+    init_lr: 0.0007
+    final_lr: 0.000007
+    cycle_epochs: 20.0   
+
+  - !LearningRateFunctionModifier
+    start_epoch: 200
+    end_epoch: 300
+    lr_func: cosine
+    init_lr: 0.0005
+    final_lr: 0.000005
+  
+pruning_modifiers:
+  
+ - !OBSPruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
+    init_sparsity: 0.4
+    final_sparsity: 0.9
+    start_epoch: 0
+    end_epoch: 200
+    update_frequency: 20
+    inter_func: cubic
+    leave_enabled: True
+    mask_type: unstructured
+    global_sparsity : True
+    num_grads: 4096
+    fisher_block_size: 64
+    damp: 1.0e-6
+
+ - !OBSPruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
+    init_sparsity: 0.9
+    final_sparsity: 0.9
+    start_epoch: 200
+    end_epoch: 300
+    update_frequency: 100
+    inter_func: cubic
+    leave_enabled: True
+    mask_type: unstructured
+    global_sparsity : True
+    num_grads: 4096
+    fisher_block_size: 64
+    damp: 1.0e-6
