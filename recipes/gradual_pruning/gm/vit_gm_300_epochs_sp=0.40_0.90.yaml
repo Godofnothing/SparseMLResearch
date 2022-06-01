@@ -24,8 +24,8 @@ training_modifiers:
     decay_rate: 0.1
   
 pruning_modifiers:
-  
- - !OBSPruningModifier
+    
+ - !GlobalMagnitudePruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
     init_sparsity: 0.4
     final_sparsity: 0.9
@@ -35,12 +35,8 @@ pruning_modifiers:
     inter_func: cubic
     leave_enabled: True
     mask_type: unstructured
-    global_sparsity : True
-    num_grads: 4096
-    fisher_block_size: 128
-    damp: 1.0e-7
 
- - !OBSPruningModifier
+ - !GlobalMagnitudePruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
     init_sparsity: 0.9
     final_sparsity: 0.9
@@ -50,7 +46,4 @@ pruning_modifiers:
     inter_func: cubic
     leave_enabled: True
     mask_type: unstructured
-    global_sparsity : True
-    num_grads: 4096
-    fisher_block_size: 128
-    damp: 1.0e-7
+    

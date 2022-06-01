@@ -27,8 +27,8 @@ pruning_modifiers:
   
  - !OBSPruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
-    init_sparsity: 0.4
-    final_sparsity: 0.9
+    init_sparsity: 0.3
+    final_sparsity: 0.6
     start_epoch: 0
     end_epoch: 200
     update_frequency: 20
@@ -42,8 +42,8 @@ pruning_modifiers:
 
  - !OBSPruningModifier
     params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
-    init_sparsity: 0.9
-    final_sparsity: 0.9
+    init_sparsity: 0.6
+    final_sparsity: 0.6
     start_epoch: 200
     end_epoch: 300
     update_frequency: 100
