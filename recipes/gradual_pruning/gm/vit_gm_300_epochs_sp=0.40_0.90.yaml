@@ -11,7 +11,7 @@ training_modifiers:
     init_lr: 0.0007
     final_lr: 0.000001
     cycle_epochs: 20.0   
-    decay_epochs: 6.0 
+    decay_epochs: 10.0 
     decay_rate: 0.1
 
   - !LearningRateFunctionModifier

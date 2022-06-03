@@ -1,5 +1,5 @@
 training_modifiers:
-  
+
   - !EpochRangeModifier
     start_epoch: 0
     end_epoch: 300
@@ -24,9 +24,9 @@ training_modifiers:
     decay_rate: 0.1
   
 pruning_modifiers:
-
-  - !GlobalMagnitudePruningModifier
-    params: ['re:(.*mlp_channels.*fc.*weight|.*mlp_channels.*proj.*weight|head.weight)'] 
+    
+ - !GlobalMagnitudePruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
     init_sparsity: 0.3
     final_sparsity: 0.75
     start_epoch: 0
@@ -36,13 +36,13 @@ pruning_modifiers:
     leave_enabled: True
     mask_type: unstructured
 
-  - !GlobalMagnitudePruningModifier
-    params: ['re:(.*mlp_channels.*fc.*weight|.*mlp_channels.*proj.*weight|head.weight)'] 
+ - !GlobalMagnitudePruningModifier
+    params: ['re:(.*blocks.*.attn.qkv.weight)|(.*blocks.*.attn.proj.weight)|(.*blocks.*.mlp.fc.*weight)']
     init_sparsity: 0.75
     final_sparsity: 0.75
-    start_epoch: 0
-    end_epoch: 200
-    update_frequency: 20
+    start_epoch: 200
+    end_epoch: 300
+    update_frequency: 100
     inter_func: cubic
     leave_enabled: True
     mask_type: unstructured
