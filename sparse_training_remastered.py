@@ -61,6 +61,7 @@ from utils.sparsity_utils import (
 )
 from utils.summary import update_summary
 from utils.manager_utils import is_update_epoch
+from optim import create_sam_optimizer
 
 # using wandb for logging
 try:
@@ -467,7 +468,10 @@ if __name__ == '__main__':
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
     # init optimizer
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    if args.sam:
+        optimizer = create_sam_optimizer(model, args)
+    else:
+        optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
     # init AMP
     grad_scaler, amp_autocast = setup_amp(args, main_logger)

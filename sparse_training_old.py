@@ -50,7 +50,7 @@ from utils import mean_value, get_current_pruning_modifier, \
     get_current_sparsity, get_sparsity_info \
 # import custom schedule
 from schedulers import CosineAnnealingWarmupRestarts
-from optim import create_sam_optimizer, create_topk_sam_optimizer
+from optim import create_sam_optimizer
 from utils.batchnorm_utils import enable_running_stats, disable_running_stats
 
 try:
@@ -456,7 +456,8 @@ def main():
         bn_momentum=args.bn_momentum,
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
-        checkpoint_path=args.initial_checkpoint)
+        checkpoint_path=args.initial_checkpoint
+    )
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -501,10 +502,8 @@ def main():
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
         model = torch.jit.script(model)
 
-    if args.sam and args.sam_topk == 0:
+    if args.sam:
         optimizer = create_sam_optimizer(model, args)
-    elif args.sam and args.sam_topk > 0:
-        optimizer = create_topk_sam_optimizer(model, args)
     else:
         optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
 
@@ -780,6 +779,7 @@ def main():
 
     try:
         for epoch in range(start_epoch, num_epochs):
+            torch.cuda.empty_cache()
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
@@ -872,6 +872,9 @@ def main():
 
     except KeyboardInterrupt:
         pass
+    else:
+        pass
+    
     if best_metric_dense > 0.0:
         _logger.info('*** Best metric (dense): {0} (epoch {1})'.format(best_metric_dense, best_epoch_dense))
     if best_metric_sparse > 0.0:
@@ -1081,4 +1084,4 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
 
 if __name__ == '__main__':
-    main()
+    main()                                                                                                                                                                                                                                                       

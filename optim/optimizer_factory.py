@@ -4,88 +4,50 @@ from .optimizers import SAM, TopKSAM
 
 
 def create_sam_optimizer(model, args):
-    if args.opt == 'sgd':
-        optimizer = SAM(
-            model.parameters(), 
-            torch.optim.SGD,
-            lr=args.lr, 
-            momentum=args.momentum,
-            weight_decay=args.weight_decay
-        )
-    elif args.opt == 'adam':
-        if not args.opt_betas:
-            args.opt_betas = (0.9, 0.999)
-            args.eps = 1e-8
-        optimizer = SAM(
-            model.parameters(), 
-            torch.optim.Adam,
-            rho=args.sam_rho,
-            lr=args.lr, 
-            weight_decay=args.weight_decay,
-            betas=args.opt_betas,
-            eps=args.eps
-        )
-
-    elif args.opt == 'adamw':
-        if not args.opt_betas:
-            args.opt_betas = (0.9, 0.999)
-            args.eps = 1e-8
-        optimizer = SAM(
-            model.parameters(), 
-            torch.optim.AdamW,
-            rho=args.sam_rho,
-            lr=args.lr, 
-            weight_decay=args.weight_decay,
-            betas=args.opt_betas,
-            eps=args.eps
-        )
+    if args.sam_topk == 0:
+        OPTIMIZER_CLASS = SAM
+        topk_kw = dict()
     else:
-        raise NotImplementedError("Unfortunately this kind of optimizer is not supported")
-    return optimizer
+        OPTIMIZER_CLASS = TopKSAM
+        topk_kw = dict(topk=args.sam_topk, global_sparsity=args.sam_global_sparsity)
 
-
-def create_topk_sam_optimizer(model, args):
     if args.opt == 'sgd':
-        optimizer = TopKSAM(
+        optimizer = OPTIMIZER_CLASS(
             model.parameters(), 
             torch.optim.SGD,
             lr=args.lr, 
-            rho=args.sam_rho,
             momentum=args.momentum,
             weight_decay=args.weight_decay,
-            topk=args.sam_topk,
-            global_sparsity=args.sam_global_sparsity
+            **topk_kw
         )
     elif args.opt == 'adam':
         if not args.opt_betas:
             args.opt_betas = (0.9, 0.999)
             args.eps = 1e-8
-        optimizer = TopKSAM(
+        optimizer = OPTIMIZER_CLASS(
             model.parameters(), 
             torch.optim.Adam,
-            lr=args.lr, 
             rho=args.sam_rho,
+            lr=args.lr, 
             weight_decay=args.weight_decay,
             betas=args.opt_betas,
             eps=args.eps,
-            topk=args.sam_topk,
-            global_sparsity=args.sam_global_sparsity
+            **topk_kw
         )
 
     elif args.opt == 'adamw':
         if not args.opt_betas:
             args.opt_betas = (0.9, 0.999)
             args.eps = 1e-8
-        optimizer = TopKSAM(
+        optimizer = OPTIMIZER_CLASS(
             model.parameters(), 
             torch.optim.AdamW,
-            lr=args.lr, 
             rho=args.sam_rho,
+            lr=args.lr, 
             weight_decay=args.weight_decay,
             betas=args.opt_betas,
             eps=args.eps,
-            topk=args.sam_topk,
-            global_sparsity=args.sam_global_sparsity
+            **topk_kw
         )
     else:
         raise NotImplementedError("Unfortunately this kind of optimizer is not supported")
