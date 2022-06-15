@@ -63,7 +63,7 @@ no_resume_opt: false
 num_classes: 1000
 opt: adamw
 opt_betas: null
-opt_eps: 1.0e-06
+opt_eps: 1.0e-08
 output: ''
 patience_epochs: 10
 pin_mem: false
