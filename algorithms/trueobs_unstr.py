@@ -221,7 +221,7 @@ def gen_database(
         trueobs[name].free()
 
     for sparsity in sparsities:
-        name = '%s_%04d.pth' % (args.model, int(sparsity * 10000))
+        name = '%04d.pth' % int(sparsity * 10000)
         torch.save(sds[sparsity], os.path.join(sparsedir, name))
 
 

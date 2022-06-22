@@ -3,6 +3,8 @@ from collections import *
 import torch
 import torch.nn as nn
 
+from modelutils import *
+
 
 def get_flops(layers, model, sample, run):
     flops = {}
@@ -38,7 +40,7 @@ def load_errors(sds, path):
             name = lines[i].strip()
             errors[name] = {}
             i += 1
-            for _ in range(len(sds)):
+            for _ in range(len(sds[name])):
                 err, level = lines[i].strip().split(' ')
                 errors[name][level] = float(err)
                 i += 1
@@ -71,28 +73,32 @@ class UnstrDatabase:
             self.load(layers, name, config[name])
 
     def load_errors(self, path):
-        return load_errors(self.sds, path)
+        return load_errors(self.db, path)
 
     def get_params(self, layers):
+        tot = 0
         res = {}
         for name in layers:
             res[name] = {}
-            for sparsity in self.sds:
+            tot += layers[name].weight.numel()
+            for sparsity in self.db[name]:
                 res[name][sparsity] = torch.sum(
-                    (self.sds[sparsity][name + '.weight'] != 0).float()
+                    (self.db[name][sparsity] != 0).float()
                 ).item()
-        return res
+        return tot, res
 
     def get_flops(self, layers, model, sample, run):
         flops = get_flops(layers, model, sample, run)
+        tot = 0
         res = {}
         for name in layers:
             res[name] = {}
-            for sparsity in self.sds:
-                res[name][sparsity] = flops[name] * torch.mean(
-                    (self.sds[sparsity][name + '.weight'] != 0).float()
+            tot += flops[name] 
+            for sparsity in self.db[name]:
+                res[name][sparsity] = flops[name] * torch.sum(
+                    (self.db[name][sparsity] != 0).float()
                 ).item()
-        return res
+        return tot, res
 
 
 def compute_squared(db, get_model, dataloader, run, filename, dataloader_passes=1):
