@@ -182,7 +182,62 @@ def get_bertsquad(layers=12):
     import bertsquad
     return bertsquad.get_model(layers=layers)
 
+class SplitAttention(nn.Module):
+
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+def split_qkv(model):
+    for block in model.blocks:
+        dim = block.attn.qkv.in_features
+        attention = SplitAttention(
+            dim,
+            num_heads=block.attn.num_heads,
+            qkv_bias=hasattr(block.attn.qkv, 'bias') and block.attn.qkv.bias is not None,
+            attn_drop=block.attn.attn_drop.p,
+            proj_drop=block.attn.proj_drop.p
+        )
+        attention.q.weight.data = block.attn.qkv.weight.data[(0 * dim):(1 * dim), :]
+        attention.q.bias.data = block.attn.qkv.bias.data[(0 * dim):(1 * dim)]
+        attention.k.weight.data = block.attn.qkv.weight.data[(1 * dim):(2 * dim), :]
+        attention.k.bias.data = block.attn.qkv.bias.data[(1 * dim):(2 * dim)]
+        attention.v.weight.data = block.attn.qkv.weight.data[(2 * dim):(3 * dim), :]
+        attention.v.bias.data = block.attn.qkv.bias.data[(2 * dim):(3 * dim)]
+        attention.proj = block.attn.proj
+        attention = attention.to(block.attn.qkv.weight.device)
+        block.attn = attention
+    return model
+
 from torchvision.models import resnet18, resnet34, resnet50, resnet101 
+from timm import create_model 
 
 get_models = {
     'rn18': lambda: resnet18(pretrained=True),
@@ -195,7 +250,8 @@ get_models = {
     'yolov5l': lambda: get_yolo('yolov5l'),
     'bertsquad': lambda: get_bertsquad(),
     'bertsquad6': lambda: get_bertsquad(6),
-    'bertsquad3': lambda: get_bertsquad(3)
+    'bertsquad3': lambda: get_bertsquad(3),
+    'deit-tiny': lambda: split_qkv(create_model('deit_tiny_patch16_224', pretrained=True))
 }
 
 def get_model(model):

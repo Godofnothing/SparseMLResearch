@@ -213,8 +213,6 @@ def gen_database(
 
     for name in trueobs:
         print(name)
-        if name != 'conv1':
-            continue
         print('Unstructured pruning ...')
         trueobs[name].prepare_unstr()
         Ws = trueobs[name].prune_unstr(sparsities)
@@ -242,21 +240,18 @@ if __name__ == '__main__':
     parser.add_argument('--datapath', type=str, default='')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--nsamples', type=int, default=1024)
-    parser.add_argument('--rounds', type=int, default=1)
-    parser.add_argument('--noaug', action='store_true')
 
     args = parser.parse_args()
 
     dataloader, testloader = get_loaders(
         args.dataset, path=args.datapath,
         nsamples=args.nsamples, seed=args.seed,
-        noaug=args.noaug
+        noaug=True
     )
     get_model, test, run = get_functions(args.model)
 
     os.makedirs(args.sparsedir, exist_ok=True)
     gen_database(
         args.sparsedir,
-        get_model, run, dataloader,
-        args.rounds
+        get_model, run, dataloader
     )

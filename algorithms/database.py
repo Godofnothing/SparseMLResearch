@@ -3,9 +3,6 @@ from collections import *
 import torch
 import torch.nn as nn
 
-from datautils import *
-from modelutils import *
-
 
 def get_flops(layers, model, sample, run):
     flops = {}
@@ -160,6 +157,7 @@ if __name__ == '__main__':
     import argparse
 
     from datautils import *
+    from modelutils import *
 
     parser = argparse.ArgumentParser()
 
@@ -179,7 +177,7 @@ if __name__ == '__main__':
     dataloader, testloader = get_loaders(
         args.dataset, path=args.datapath,
         nsamples=args.nsamples, seed=args.seed,
-        noaug=args.mode == 'loss'
+        noaug=True
     )
 
     model = get_model()
