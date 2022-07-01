@@ -1,5 +1,4 @@
 import os
-import re
 import timm
 import torch
 import wandb
@@ -11,13 +10,10 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 #
 from copy import deepcopy
-from functools import partial
-from collections import defaultdict
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
 from sklearn.model_selection import train_test_split
 from sparseml.pytorch.optim import ScheduledModifierManager
-from sparseml.pytorch.utils import GradSampler
 # 
 from engine import val_epoch
 
@@ -28,6 +24,7 @@ def parse_args():
     parser.add_argument('--model', default='deit_small_patch16_224', type=str)
     # Experiment
     parser.add_argument('--experiment', default='', type=str)
+    parser.add_argument('--seed', default=42, type=int)
     # Path to data
     parser.add_argument('--data-dir', required=True, type=str)
     # Path to recipe
@@ -39,11 +36,11 @@ def parse_args():
     parser.add_argument('--prefetch', default=2, type=int)
     # Sparsities
     parser.add_argument('--sparsities', nargs='+', required=True, type=float)
-    # AdaPrune params
-    parser.add_argument('--load-calibration-images', action='store_true')
-    parser.add_argument('--num-calibration-images', default=1000, type=int)
-    # Path to imagenet labels
-    parser.add_argument('--path-to-labels', required=True, type=str)
+    # SPDY params
+    parser.add_argument('--spdy_loader', action='store_true')
+    parser.add_argument('--num_calibration_images', default=1024, type=int)
+    # MFAC params
+    parser.add_argument('--mfac_loader', action='store_true')
     # Save arguments
     parser.add_argument('--save-dir', default='./output/one-shot', type=str, 
                         help='dir to save results')
@@ -55,9 +52,17 @@ def parse_args():
     return args
 
 
+def random_subset(dataset, num_samples: int):
+    ids = np.random.permutation(len(dataset))[:num_samples]
+    return Subset(dataset, ids)
+
+
 if __name__ == '__main__':
     # parse args
     args = parse_args()
+    # seed all
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # set num threads
@@ -113,16 +118,22 @@ if __name__ == '__main__':
         pin_memory=True
     )
 
-    # prepare calibration images
-    if args.load_calibration_images:
-        train_ids_all = range(len(train_dataset))
-        train_labels_all = np.load(args.path_to_labels)
-        train_ids, _, train_labels, _ =  train_test_split(
-            train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
-        calibration_images = torch.stack([train_dataset[i][0] for i in train_ids], dim=0).to(device)
+    if args.spdy_loader:
+        calibration_dataset = ImageFolder(root=f'{args.data_dir}/train', transform=val_transforms)
+        train_subset = random_subset(calibration_dataset, args.num_calibration_images)
+        # calibration loader
+        calibration_loader = DataLoader(
+            train_subset, 
+            batch_size=args.batch_size, 
+            shuffle=False, 
+            num_workers=args.workers, 
+            pin_memory=True
+        )
+    else:
+        calibration_loader = None
 
     # define for M-FAC pruner
-    def mfac_data_generator(**kwargs):
+    def mfac_data_generator(device=device, **kwargs):
         while True:
             for input, target in train_loader:
                 input, target = input.to(device), target.to(device)
@@ -141,6 +152,22 @@ if __name__ == '__main__':
     experiment_data = {
         'sparsity': args.sparsities, 'val/acc' : []
     }
+    # define addtional args for SPDY
+    if args.spdy_loader:
+        spdy_kw = dict(loader=calibration_loader, loss_fn=loss_fn)
+    else:
+        spdy_kw = {}
+    # define additional args for M-FAC/OBS
+    if args.mfac_loader:
+        mfac_kw = dict(
+            grad_sampler = {
+                'data_loader_builder' : mfac_data_generator, 
+                'loss_function' : loss_fn,
+            },
+        )
+    else:
+        mfac_kw = {}
+
     for sparsity in args.sparsities:
         print(f'Sparsity {sparsity:.3f}')
         model_sparse = deepcopy(model)
@@ -152,14 +179,12 @@ if __name__ == '__main__':
         # apply recipe
         optimizer = manager.apply(
             model_sparse, 
-            grad_sampler={
-                'data_loader_builder' : mfac_data_generator,
-                'loss_function' : loss_fn,
-            },
             teacher_model=model,
+            **mfac_kw,
+            **spdy_kw,
             finalize=True
         )
-        # evaluate after AdaPrune
+        # evaluate 
         val_acc = val_epoch(model_sparse, val_loader, loss_fn, device=device)['acc']
         # update experiment data
         experiment_data['val/acc'].append(val_acc)
