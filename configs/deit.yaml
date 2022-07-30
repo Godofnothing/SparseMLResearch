@@ -10,7 +10,7 @@ channels_last: false
 checkpoint_hist: 10
 clip_grad: null
 clip_mode: norm
-color_jitter: 0.4
+color_jitter: 0.3
 cooldown_epochs: 10
 crop_pct: 0.9
 cutmix: 1.0

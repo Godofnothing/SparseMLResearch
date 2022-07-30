@@ -12,10 +12,11 @@ import torchvision.transforms as T
 from copy import deepcopy
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import ImageFolder
-from sklearn.model_selection import train_test_split
+from torch.nn.parallel import DistributedDataParallel
 from sparseml.pytorch.optim import ScheduledModifierManager
 # 
 from engine import val_epoch
+from models.vision_transformer import split_qkv
 
 
 def parse_args():
@@ -47,6 +48,8 @@ def parse_args():
     # Logging
     parser.add_argument('--log-wandb', action='store_true')
     parser.add_argument('--log-freq', default=100, type=int)
+    # Misc params
+    parser.add_argument('--split_qkv', action='store_true')
 
     args = parser.parse_args()
     return args
@@ -143,6 +146,8 @@ if __name__ == '__main__':
     loss_fn = nn.CrossEntropyLoss()
     # model
     model = timm.create_model(args.model, pretrained=True)
+    if args.split_qkv:
+        model = split_qkv(model)
     model = model.to(device)
     # first evaluation
     val_acc = val_epoch(model, val_loader, loss_fn, device=device)['acc']
@@ -154,7 +159,7 @@ if __name__ == '__main__':
     }
     # define addtional args for SPDY
     if args.spdy_loader:
-        spdy_kw = dict(loader=calibration_loader, loss_fn=loss_fn)
+        spdy_kw = dict(calibration_loader=calibration_loader, loss_fn=loss_fn)
     else:
         spdy_kw = {}
     # define additional args for M-FAC/OBS

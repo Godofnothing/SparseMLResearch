@@ -31,7 +31,7 @@ from collections import OrderedDict
 from contextlib import nullcontext, suppress
 from datetime import datetime, timedelta
 
-from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
 
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
@@ -43,15 +43,14 @@ from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 # sparseml imports
 from sparseml.pytorch.optim import ScheduledModifierManager
-from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch, GradSampler
+from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch
 # import utils
-from utils import mean_value, get_current_pruning_modifier, \
-    get_current_learning_rate_modifier, is_update_epoch, \
-    get_current_sparsity, get_sparsity_info \
+from utils import is_update_epoch, get_current_sparsity, get_sparsity_info \
 # import custom schedule
 from schedulers import CosineAnnealingWarmupRestarts
 from optim import create_sam_optimizer
 from utils.batchnorm_utils import enable_running_stats, disable_running_stats
+from utils.model_specific_utils import split_qkv
 
 try:
     from apex import amp
@@ -137,11 +136,10 @@ def parse_args():
                         help='input batch size for training (default: 128)')
     parser.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                         help='validation batch size override (default: None)')
-    parser.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
-                        help='mfac batch size override (default: None)')
-    parser.add_argument('--mfac-loader', action='store_true',
-                        help='whether to use separate loader for MFAC (default: False)')
-    
+    parser.add_argument('--aux-loader', action='store_true',
+                        help='whether to create aux loader for MFAC/AdaPrune (default: False)')
+    parser.add_argument('-ab', '--aux-batch-size', type=int, default=None, metavar='N',
+                        help='batch size of aux loader (default: None)')
 
     # Optimizer parameters
     parser.add_argument('--opt', default='sgd', type=str, metavar='OPTIMIZER',
@@ -351,16 +349,15 @@ def parse_args():
                         help='end of pruning stage')
 
     # AdaPrune calibration images args
-    parser.add_argument('--load-calibration-images', action='store_true',
-                        help='whether to use calibration images')
     parser.add_argument('--num-calibration-images', default=1000, type=int,
                         help='number of images used for calibration')
-    parser.add_argument('--path-to-labels', default='./data/imagenet_train_labels.npy', type=str, 
-                        help='path-to-imagenet-labels')
-
+    parser.add_argument('--spdy-loader', action='store_true',
+                        help='whether to create aux loader for SPDY (default: False)')
     # Whether to save last model
     parser.add_argument('--save-last', action='store_true', default=False,
                         help='Whether to save the last state of the model')
+    # Whether to split qkv->q,k,v
+    parser.add_argument('--split-qkv', action='store_true')
 
     # Worker timedelta
     parser.add_argument('--timeout', type=int, default=1800,
@@ -381,6 +378,11 @@ def parse_args():
     # Cache the args as a text string to save them in the output dir later
     args_text = yaml.safe_dump(args.__dict__, default_flow_style=False)
     return args, args_text
+
+
+def random_subset(dataset, num_samples: int):
+    ids = np.random.permutation(len(dataset))[:num_samples]
+    return Subset(dataset, ids)
 
 
 def main():
@@ -478,6 +480,10 @@ def main():
     if args.split_bn:
         assert num_aug_splits > 1 or args.resplit
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
+
+    # split QKV->Q,K,V
+    if args.split_qkv:
+        model = split_qkv(model)
 
     # move model to GPU, enable channels last layout if set
     model.cuda()
@@ -673,11 +679,11 @@ def main():
     )
 
     # make separate MFAC-loader
-    if args.mfac_loader:
-        loader_mfac = create_loader(
+    if args.aux_loader:
+        loader_aux = create_loader(
             dataset_train,
             input_size=data_config['input_size'],
-            batch_size=args.mfac_batch_size,
+            batch_size=args.aux_batch_size,
             is_training=True,
             use_prefetcher=args.prefetcher,
             interpolation=data_config['interpolation'],
@@ -691,9 +697,14 @@ def main():
 
         def mfac_data_generator(device=args.device, **kwargs):
             while True:
-                for input, target in loader_mfac:
+                for input, target in loader_aux:
                     input, target = input.to(device), target.to(device)
                     yield [input], {}, target
+
+        def calibration_loader(**kwargs):
+            while True:
+                for input, target in loader_aux:
+                    yield input
 
     # setup loss function
     if args.jsd_loss:
@@ -724,19 +735,28 @@ def main():
             'data_loader_builder' : mfac_data_generator,
             'loss_function' : validate_loss_fn
         }
-    } if args.mfac_loader else {}
-        
-    # prepare calibration images (if AdaPrune used)
-    if args.load_calibration_images:
-        if args.local_rank == 0:
-            _logger.info(f"Collecting {args.num_calibration_images} for AdaPrune")
-        train_ids_all = range(len(dataset_train))
-        train_labels_all = np.load(args.path_to_labels)
-        train_ids, _, train_labels, _ =  train_test_split(
-            train_ids_all, train_labels_all, stratify=train_labels_all, train_size=args.num_calibration_images)
-        calibration_images = torch.stack(
-            [torch.tensor(dataset_train[i][0], device=args.device, dtype=torch.float32) for i in train_ids], dim=0)
-        bonus_kw['calibration_images'] = calibration_images
+    } if args.aux_loader else {}
+
+    if args.spdy_loader:
+        calibration_subset = random_subset(dataset_train, args.num_calibration_images)
+        # calibration loader
+        calibration_loader = create_loader(
+            calibration_subset,
+            input_size=data_config['input_size'],
+            batch_size=args.validation_batch_size or args.batch_size,
+            is_training=False,
+            no_aug=True,
+            use_prefetcher=args.prefetcher,
+            interpolation=data_config['interpolation'],
+            mean=data_config['mean'],
+            std=data_config['std'],
+            num_workers=args.workers,
+            distributed=args.distributed,
+            crop_pct=data_config['crop_pct'],
+            pin_memory=args.pin_mem,
+        )
+        bonus_kw['calibration_loader'] = calibration_loader
+        bonus_kw['loss_fn'] = validate_loss_fn
 
     manager = ScheduledModifierManager.from_yaml(args.sparseml_recipe)
     # wrap optimizer  
@@ -779,14 +799,21 @@ def main():
 
     try:
         for epoch in range(start_epoch, num_epochs):
+
             torch.cuda.empty_cache()
             if args.distributed and hasattr(loader_train.sampler, 'set_epoch'):
                 loader_train.sampler.set_epoch(epoch)
 
             train_metrics = train_one_epoch(
                 epoch, model, loader_train, optimizer, train_loss_fn, args,
-                lr_scheduler=lr_scheduler, output_dir=output_dir, amp_autocast=amp_autocast, 
-                loss_scaler=loss_scaler, model_ema=model_ema, mixup_fn=mixup_fn
+                lr_scheduler=lr_scheduler, 
+                output_dir=output_dir, 
+                amp_autocast=amp_autocast, 
+                loss_scaler=loss_scaler, 
+                model_ema=model_ema, 
+                mixup_fn=mixup_fn,
+                loader_eval=loader_eval,
+                validate_loss_fn=validate_loss_fn
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -898,9 +925,21 @@ def main():
 
 
 def train_one_epoch(
-        epoch, model, loader, optimizer, loss_fn, args,
-        lr_scheduler=None, output_dir=None, amp_autocast=suppress,
-        loss_scaler=None, model_ema=None, mixup_fn=None):
+    epoch, 
+    model, 
+    loader, 
+    optimizer, 
+    loss_fn, 
+    args,
+    lr_scheduler=None, 
+    output_dir=None, 
+    amp_autocast=suppress,
+    loss_scaler=None, 
+    model_ema=None, 
+    mixup_fn=None,
+    loader_eval=None,
+    validate_loss_fn=None,
+):
     
     # define closure for SAM
     def closure():
@@ -974,6 +1013,14 @@ def train_one_epoch(
         num_updates += 1
         batch_time_m.update(time.time() - end)
         lr = 0.0
+
+        if batch_idx == 0 and is_update_epoch(optimizer.wrapped_manager, epoch):
+            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
+
+            _logger.info(f"Accuracy after pruning: {eval_metrics['top1']:>7.4f}")
+            if args.log_wandb and args.local_rank == 0:
+                wandb.log({'val_after_pruning/top1': eval_metrics['top1']}, step=epoch)
+
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
@@ -1084,4 +1131,4 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
 
 if __name__ == '__main__':
-    main()                                                                                                                                                                                                                                                       
+    main()

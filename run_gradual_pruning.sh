@@ -1,19 +1,20 @@
 #!/bin/bash
 
-NUM_PROC=4
+NUM_PROC=$(wc -w <<< $(tr ',' ' ' <<< $CUDA_VISIBLE_DEVICES))
 MASTER_PORT=29501
+BATCH_SIZE_PER_GPU=$(( 1024 / ${NUM_PROC} ))
 
 # for das8gpu4
-# DATA_DIR=/nvmedisk/Datasets/ILSVRC/Data/CLS-LOC 
+DATA_DIR=/nvmedisk/Datasets/ILSVRC/Data/CLS-LOC 
 # for gpu224
-DATA_DIR=/localhome/dkuznede/Datasets/ILSVRC
+# DATA_DIR=/localhome/dkuznede/Datasets/ILSVRC
 # for zhores
 # DATA_DIR=/gpfs/gpfs0/datasets/ImageNet/ILSVRC2012
 # for ultramar
 # DATA_DIR=/mnt/data/imagenet
 
 MODEL=deit_small_patch16_224
-EXP=GP_OBS_300_ep_${MODEL}_sp=0.4_0.9
+EXP=GP_300_ep_${MODEL}_obc+obs_sp=0.30_0.60_B=128_Ng=4096_D=1e-8_Nr=1
 
 python -m torch.distributed.launch \
     --nproc_per_node=${NUM_PROC} \
@@ -22,8 +23,8 @@ python -m torch.distributed.launch \
     \
     ${DATA_DIR} \
     \
-    --config configs/deit_old.yaml \
-    --sparseml-recipe recipes/gradual_pruning/obs/vit_obs_300_epochs_sp=0.40_0.90_block_size=64_damp=1e-6_num_grads=4096.yaml \
+    --config configs/deit.yaml \
+    --sparseml-recipe recipes/gradual_pruning/obc+obs/cyclic_exponential/vit_obc+obs_sp=0.30_0.60_B=128_Ng=4096_D=1e-8_Nr=1.yaml \
     \
     --dataset imagenet \
     \
@@ -32,12 +33,16 @@ python -m torch.distributed.launch \
     \
     --experiment ${EXP} \
     \
-    -b 256 \
+    -b ${BATCH_SIZE_PER_GPU} \
     -vb 500 \
-    --workers 16 \
+    --workers 8 \
     \
-    --mfac-loader \
-    --mfac-batch-size 128 \
+    --aux-loader \
+    --aux-batch-size 128 \
+    \
+    --split-qkv \
+    \
+    --spdy-loader \
     \
     --log-sparsity \
     --log-wandb \
@@ -47,5 +52,5 @@ python -m torch.distributed.launch \
     --checkpoint-freq 20 \
     --save-last \
     \
-    --timeout 3600 \
+    --timeout 18000 \
     \

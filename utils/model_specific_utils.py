@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
 
+from timm.models.xcit import XCABlock
 from timm.models.vision_transformer import Attention
+from timm.models.swin_transformer import SwinTransformerBlock
 
 
 __all__ = [
