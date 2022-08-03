@@ -57,7 +57,6 @@ def train_one_epoch(
             value=args.clip_grad, 
             mode=args.clip_mode
         )
-    
 
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -100,6 +99,7 @@ def train_one_epoch(
         if grad_scaler is not None:
             grad_scaler.scale(loss).backward(create_graph=second_order)
             if args.clip_grad is not None:
+                grad_scaler.unscale_(optimizer)
                 clip_grad_fn()
 
             if args.sam:

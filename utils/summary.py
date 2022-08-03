@@ -19,12 +19,14 @@ def update_summary(
     filename, 
     write_header=False, 
     log_wandb=False,
+    param_hist={},
     **aux_kw 
 ):
     epoch_summary = OrderedDict(epoch=epoch)
     epoch_summary.update([('train/' + k, v) for k, v in train_metrics.items()])
     epoch_summary.update([('eval/' + k, v) for k, v in eval_metrics.items()])
-    epoch_summary.update([(k, v) for k, v in aux_kw.items()] )
+    epoch_summary.update([(k, v) for k, v in param_hist.items()])
+    epoch_summary.update([(k, v) for k, v in aux_kw.items()])
 
     if log_wandb:
         wandb.log(epoch_summary)

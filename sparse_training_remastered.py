@@ -5,9 +5,6 @@ import torch
 import logging
 import argparse
 
-import torch.nn as nn
-
-from argparse import Namespace
 from torch.nn.parallel import DistributedDataParallel
 
 from timm.data import (
@@ -61,6 +58,7 @@ from utils.sparsity_utils import (
 )
 from utils.summary import update_summary
 from utils.manager_utils import is_update_epoch
+from utils.model_specific_utils import split_qkv
 from optim import create_sam_optimizer
 
 # using wandb for logging
@@ -103,9 +101,9 @@ def parse_args():
     group = parser.add_argument_group('SparseML parameters')
     group.add_argument('--sparseml-recipe', required=True, type=str,
                         help='YAML config file with the sparsification recipe')
-    group.add_argument('-mb', '--mfac-batch-size', type=int, default=None, metavar='N',
-                        help='mfac batch size override (default: None)')
-    group.add_argument('--mfac-loader', action='store_true',
+    group.add_argument('-ab', '--aux-batch-size', type=int, default=None, metavar='N',
+                        help='aux batch size override (default: None)')
+    group.add_argument('--aux-loader', action='store_true',
                         help='whether to use separate loader for MFAC (default: False)')
 
     # Model parameters
@@ -282,6 +280,7 @@ def parse_args():
                         help='Drop path rate (default: None)')
     group.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                         help='Drop block rate (default: None)')
+
     # Distributed training params
     group = parser.add_argument_group('Distributed training parameters')
     parser.add_argument('--dist_backend', default='nccl', type=str,
@@ -323,6 +322,8 @@ def parse_args():
                         help='log training and validation metrics to wandb')
     group.add_argument('--log-sparsity', action='store_true', default=False,
                         help='Log sparsity distribution at pruning step')
+    group.add_argument('--log_param_histogram', action='store_true', default=False,
+                        help='Log histogram of params (works only if log_wandb = True)')
 
     # Misc
     group = parser.add_argument_group('Miscellaneous parameters')
@@ -361,6 +362,8 @@ def parse_args():
                         help='Whether to save the last state of the model')
     group.add_argument('--save-freq', type=int, default=-1, metavar='N',
                         help='checkpointing frequency (default: no saving epoch checkpoints)')
+    group.add_argument('--split-qkv', action='store_true',
+                        help='whether to split qkv->q,k,v in attention')
 
     config_args, remaining_args = config_parser.parse_known_args()
     if config_args.config:
@@ -377,8 +380,6 @@ def parse_args():
     return args, text_args
 
 
-
-# from timm.utils import setup_default_logging
 
 if __name__ == '__main__':
     setup_default_logging()
@@ -399,7 +400,7 @@ if __name__ == '__main__':
     if args.log_wandb:
         if has_wandb and args.rank == 0:
             wandb.init(
-                project=f"SparseTraining|{args.model}", 
+                project=f"SparseTraining", 
                 name=f"{args.model}/{args.experiment}",
                 config=args
             )
@@ -445,6 +446,10 @@ if __name__ == '__main__':
     if args.split_bn:
         assert num_aug_splits > 1 or args.resplit
         model = convert_splitbn_model(model, max(num_aug_splits, 2))
+
+    # split QKV->Q,K,V
+    if args.split_qkv:
+        model = split_qkv(model)
 
     # move model to GPU, enable channels last layout if set
     model.to(args.device)
@@ -603,12 +608,12 @@ if __name__ == '__main__':
         pin_memory=args.pin_mem,
     )
 
-    # make separate MFAC-loader
-    if args.mfac_loader:
+    # make separate aux loader
+    if args.aux_loader:
         loader_mfac = create_loader(
             train_dataset,
             input_size=data_config['input_size'],
-            batch_size=args.mfac_batch_size,
+            batch_size=args.aux_batch_size,
             is_training=True,
             use_prefetcher=args.prefetcher,
             interpolation=data_config['interpolation'],
@@ -620,7 +625,7 @@ if __name__ == '__main__':
             pin_memory=args.pin_mem
         )
 
-        def mfac_data_generator(device=args.device, **kwargs):
+        def aux_data_generator(device=args.device, **kwargs):
             while True:
                 for input, target in loader_mfac:
                     input, target = input.to(device), target.to(device)
@@ -633,9 +638,9 @@ if __name__ == '__main__':
     ############$############
 
     manager_kw = {}
-    if args.mfac_loader:
+    if args.aux_loader:
         manager_kw['grad_sampler'] = {
-            'data_loader_builder' : mfac_data_generator,
+            'data_loader_builder' : aux_data_generator,
             'loss_function' : valid_loss_fn
         }
 
@@ -741,22 +746,32 @@ if __name__ == '__main__':
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
-            if output_dir is not None:
-                lr_param = [param_group['lr'] for param_group in optimizer.param_groups]
-                lr_m = sum(lr_param) / len(lr_param)
-                # get current lr
-                update_summary(
-                    epoch,
-                    train_metrics,
-                    eval_metrics,
-                    filename=f'{output_dir}/summary.csv',
-                    write_header=(epoch == start_epoch),
-                    log_wandb=args.log_wandb,
-                    lr=lr_m,
-                    sparsity=mean_sparsity
-                )
-
             if args.local_rank == 0:
+                if output_dir is not None:
+                    lr_param = [param_group['lr'] for param_group in optimizer.param_groups]
+                    lr_m = sum(lr_param) / len(lr_param)
+                    # log param histogram
+                    param_hist = {}
+                    if args.log_param_histogram and args.log_wandb:
+                        for param_name, param in model.named_parameters():
+                            # strip module
+                            module_key = 'module.'
+                            if param_name.startswith(module_key):
+                                param_name = param_name[len(module_key):]
+                            param_nnz = param[param != 0.0].detach().cpu().numpy()
+                            param_hist[param_name] = wandb.Histogram(param_nnz)
+                    # get current lr
+                    update_summary(
+                        epoch,
+                        train_metrics,
+                        eval_metrics,
+                        filename=f'{output_dir}/summary.csv',
+                        write_header=(epoch == start_epoch),
+                        log_wandb=args.log_wandb,
+                        param_hist=param_hist,
+                        lr=lr_m,
+                        sparsity=mean_sparsity,
+                    )
                 if epoch % args.save_freq == 0 and args.save_freq > 0:
                     save_model(
                         path=f'{output_dir}/{args.model}_epoch={epoch}.pth',
