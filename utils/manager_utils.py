@@ -2,12 +2,10 @@ from sparseml.pytorch.optim import ScheduledModifierManager
 
 
 def get_current_pruning_modifier(manager : ScheduledModifierManager, epoch: int):
-    current_pruning_modifier = None
     for pruning_modifier in manager.pruning_modifiers:
         if pruning_modifier.start_epoch <= epoch < pruning_modifier.end_epoch:
-            current_pruning_modifier = pruning_modifier
-            break
-    return current_pruning_modifier
+            return pruning_modifier
+    return None
     
 
 def get_current_learning_rate_modifier(manager : ScheduledModifierManager, epoch: int):

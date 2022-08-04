@@ -33,32 +33,40 @@ from datetime import datetime, timedelta
 
 from torch.utils.data import Subset
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
-
+# timm imports
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.models import create_model, safe_model_name, convert_splitbn_model, model_parameters
-from timm.utils import *
-from timm.loss import *
+from timm.utils import (
+    ModelEmaV2,
+    AverageMeter,
+    random_seed, 
+    set_jit_fuser, 
+    distribute_bn,
+    setup_default_logging,
+    get_outdir,
+    dispatch_clip_grad,
+    reduce_tensor,
+    accuracy
+)
+from timm.loss import (
+    JsdCrossEntropy, 
+    BinaryCrossEntropy, 
+    SoftTargetCrossEntropy,
+    LabelSmoothingCrossEntropy
+)
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
-from timm.utils import ApexScaler, NativeScaler
+from timm.utils import NativeScaler
 # sparseml imports
 from sparseml.pytorch.optim import ScheduledModifierManager
 from sparseml.pytorch.utils import save_model, load_model, load_optimizer, load_epoch
 # import utils
-from utils import is_update_epoch, get_current_sparsity, get_sparsity_info \
-# import custom schedule
-from schedulers import CosineAnnealingWarmupRestarts
+from utils import is_update_epoch, get_current_sparsity, get_sparsity_info 
 from optim import create_sam_optimizer
 from utils.batchnorm_utils import enable_running_stats, disable_running_stats
 from utils.model_specific_utils import split_qkv
+from utils.summary import update_summary
 
-try:
-    from apex import amp
-    from apex.parallel import DistributedDataParallel as ApexDDP
-    from apex.parallel import convert_syncbn_model
-    has_apex = True
-except ImportError:
-    has_apex = False
 
 has_native_amp = False
 try:
@@ -329,24 +337,13 @@ def parse_args():
                         help='convert model torchscript for inference')
     parser.add_argument('--fuser', default='', type=str,
                         help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
+    # Logging params
     parser.add_argument('--log-wandb', action='store_true', default=False,
                         help='log training and validation metrics to wandb')
     parser.add_argument('--log-sparsity', action='store_true', default=False,
                         help='whether to log sparsity on each pruning step')
-
-    # CosineAnnealingWarmupRestarts args
-    parser.add_argument('--prune-start-epoch', type=int, default=125,
-                        help='start of pruning stage')
-    parser.add_argument('--prune-end-epoch', type=int, default=525,
-                        help='end of pruning stage')
-    parser.add_argument('--prune-frequency', type=int, default=25,
-                        help='pruning frequency')
-    parser.add_argument('--period-warmup', type=int, default=5,
-                        help='warmup epochs after each AC/DC stage')
-    parser.add_argument('--lr-even-mult', type=float, default=1.0,
-                        help='end of pruning stage')
-    parser.add_argument('--lr-odd-mult', type=float, default=1.0,
-                        help='end of pruning stage')
+    parser.add_argument('--log-param-histogram', action='store_true', default=False,
+                        help='Log histogram of params (works only if log_wandb = True)')
 
     # AdaPrune calibration images args
     parser.add_argument('--num-calibration-images', default=1000, type=int,
@@ -358,7 +355,6 @@ def parse_args():
                         help='Whether to save the last state of the model')
     # Whether to split qkv->q,k,v
     parser.add_argument('--split-qkv', action='store_true')
-
     # Worker timedelta
     parser.add_argument('--timeout', type=int, default=1800,
                         help='Worker timeout')
@@ -417,7 +413,7 @@ def main():
     if args.log_wandb:
         if has_wandb and args.rank == 0:
             wandb.init(
-                project=f"SparseTraining|{args.model}", 
+                project=f"SparseTraining", 
                 name=f"{args.model}/{args.experiment}",
                 config=args
             )
@@ -431,15 +427,10 @@ def main():
         # `--amp` chooses native amp before apex (APEX ver not actively maintained)
         if has_native_amp:
             args.native_amp = True
-        elif has_apex:
-            args.apex_amp = True
-    if args.apex_amp and has_apex:
-        use_amp = 'apex'
-    elif args.native_amp and has_native_amp:
-        use_amp = 'native'
-    elif args.apex_amp or args.native_amp:
-        _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
-                        "Install NVIDA apex or upgrade to PyTorch 1.6")
+            use_amp = 'native'
+        else:
+            _logger.warning("Neither APEX or native Torch AMP is available, using float32. "
+                            "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     random_seed(args.seed, args.rank)
 
@@ -493,11 +484,7 @@ def main():
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
         assert not args.split_bn
-        if has_apex and use_amp == 'apex':
-            # Apex SyncBN preferred unless native amp is activated
-            model = convert_syncbn_model(model)
-        else:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         if args.local_rank == 0:
             _logger.info(
                 'Converted model to use Synchronized BatchNorm. WARNING: You may have issues if using '
@@ -516,12 +503,7 @@ def main():
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
-    if use_amp == 'apex':
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        loss_scaler = ApexScaler()
-        if args.local_rank == 0:
-            _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
-    elif use_amp == 'native':
+    if use_amp == 'native':
         amp_autocast = torch.cuda.amp.autocast
         loss_scaler = NativeScaler()
         if args.local_rank == 0:
@@ -554,36 +536,15 @@ def main():
             model, decay=args.model_ema_decay, device='cpu' if args.model_ema_force_cpu else None)
 
     # setup distributed training
-    if args.distributed:
-        if has_apex and use_amp == 'apex':
-            # Apex DDP preferred unless native amp is activated
-            if args.local_rank == 0:
-                _logger.info("Using NVIDIA APEX DistributedDataParallel.")
-            model = ApexDDP(model, delay_allreduce=True)
-        else:
-            if args.local_rank == 0:
-                _logger.info("Using native Torch DistributedDataParallel.")
-            model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
+    if args.distributed :
+        if args.local_rank == 0:
+            _logger.info("Using native Torch DistributedDataParallel.")
+        model = NativeDDP(model, device_ids=[args.local_rank], broadcast_buffers=not args.no_ddp_bb)
         # NOTE: EMA model does not need to be wrapped by DDP
 
     # setup learning rate schedule and starting epoch
-    if args.sched == 'cosine_sparse':
-        lr_schedule_fn = CosineAnnealingWarmupRestarts(
-            start_epoch=args.prune_start_epoch, 
-            end_epoch=args.prune_end_epoch, 
-            T_max=args.epochs,
-            update_frequency=args.prune_frequency,
-            init_warmup=args.warmup,
-            period_warmup=args.period_warmup, 
-            warmup_lr_mult=args.min_lr / args.lr,
-            min_lr_mult=args.warmup_lr / args.lr, 
-            lr_even_mult=args.lr_even_mult,
-            lr_odd_mult=args.lr_odd_mult
-        )
-        lr_scheduler, num_epochs = \
-            torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn, last_epoch=args.start_epoch), args.epochs
-    else:
-        lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+    lr_scheduler, num_epochs = create_scheduler(args, optimizer)
+    # set start epoch
     start_epoch = 0
     if args.start_epoch is not None:
         # a specified start_epoch will always override the resume epoch
@@ -777,10 +738,16 @@ def main():
             _logger.info("Disabling timm LR scheduler, managing LR using SparseML recipe")
             _logger.info(f"Overriding max_epochs to {num_epochs} from SparseML recipe")
 
-    # setup checkpoint saver and eval metric tracking
+    # set default best metric
     eval_metric = args.eval_metric
-    best_metric_dense, best_metric_sparse = 0.0, 0.0
-    best_epoch_dense, best_epoch_sparse = None, None
+    best_metric = None
+    best_epoch  = None
+    decreasing  = True if 'loss' in eval_metric else False
+    # set comparison
+    if decreasing:
+        is_better = lambda x, y: x < y 
+    else:
+        is_better = lambda x, y: x > y
     output_dir = None
     if args.rank == 0:
         if args.experiment:
@@ -811,9 +778,7 @@ def main():
                 amp_autocast=amp_autocast, 
                 loss_scaler=loss_scaler, 
                 model_ema=model_ema, 
-                mixup_fn=mixup_fn,
-                loader_eval=loader_eval,
-                validate_loss_fn=validate_loss_fn
+                mixup_fn=mixup_fn
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -834,28 +799,43 @@ def main():
                     ema_eval_metrics = validate(
                         model_ema.module, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast, log_suffix=' (EMA)')
                     eval_metrics = ema_eval_metrics
-            # add mean sparsity to logged dict
-            eval_metrics['sparsity'] = mean_sparsity
 
             if lr_scheduler is not None:
-                if args.sched == 'cosine_annealing':
-                    lr_scheduler.step()
-                else:
-                    # step LR for next epoch
-                    lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
-
-            if output_dir is not None:
-                update_summary(
-                    epoch, train_metrics, eval_metrics, os.path.join(output_dir, 'summary.csv'),
-                    write_header=best_metric_dense is None, log_wandb=args.log_wandb and has_wandb
-                )
+                # step LR for next epoch
+                lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
 
             if args.local_rank == 0:
+                if output_dir is not None:
+                    lr_param = [param_group['lr'] for param_group in optimizer.param_groups]
+                    lr_m = sum(lr_param) / len(lr_param)
+                    # log param histogram
+                    param_hist = {}
+                    if args.log_param_histogram and args.log_wandb:
+                        for param_name, param in model.named_parameters():
+                            # strip module
+                            module_key = 'module.'
+                            if param_name.startswith(module_key):
+                                param_name = param_name[len(module_key):]
+                            param_nnz = param[param != 0.0].detach().cpu().numpy()
+                            param_hist[param_name] = wandb.Histogram(param_nnz)
+                    # get current lr
+                    update_summary(
+                        epoch,
+                        train_metrics,
+                        eval_metrics,
+                        filename=f'{output_dir}/summary.csv',
+                        write_header=(epoch == start_epoch),
+                        log_wandb=args.log_wandb and has_wandb,
+                        param_hist=param_hist,
+                        lr=lr_m,
+                        sparsity=mean_sparsity,
+                    )
                 if epoch % args.checkpoint_freq == 0 and args.checkpoint_freq > 0:
                     save_model(
                         path=f'{output_dir}/{args.model}_epoch={epoch}.pth',
                         model=model, 
                         optimizer=optimizer, 
+                        loss_scaler=loss_scaler,
                         epoch=epoch,
                         use_zipfile_serialization_if_available=True,
                         include_modifiers=True
@@ -868,60 +848,34 @@ def main():
                     sparsity_info = json.loads(get_sparsity_info(model))
                     with open(f'{output_dir}/sparsity_distribution_epoch={epoch}.json', 'w') as outfile:
                         json.dump(sparsity_info, outfile)
-
-                # save best sparse checkpoint
-                if mean_sparsity > 0.0 and eval_metrics[eval_metric] > best_metric_sparse:
-                    best_metric_sparse = eval_metrics[eval_metric]
-                    best_epoch_sparse = epoch
+                    # reset current best metric
+                    best_metric = None
+                # save best checkpoint
+                if best_metric is None or is_better(eval_metrics[eval_metric], best_metric):
+                    best_metric = eval_metrics[eval_metric]
+                    best_epoch = epoch
                     save_model(
-                        path=f'{output_dir}/{args.model}_sparse_best.pth',
+                        path=f'{output_dir}/{args.model}_sparsity={mean_sparsity:.2f}_best.pth',
                         model=model, 
                         optimizer=optimizer, 
+                        loss_scaler=loss_scaler,
                         epoch=epoch,
                         use_zipfile_serialization_if_available=True,
                         include_modifiers=True
                     )
-                    _logger.info(f'New best sparse model on epoch {epoch} with accuracy {best_metric_sparse:.4f}')
-
-                # save best dense checkpoint
-                if mean_sparsity == 0.0 and eval_metrics[eval_metric] > best_metric_dense:
-                    best_metric_dense = eval_metrics[eval_metric]
-                    best_epoch_dense = epoch
-                    save_model(
-                        path=f'{output_dir}/{args.model}_dense_best.pth',
-                        model=model, 
-                        optimizer=optimizer, 
-                        epoch=epoch,
-                        use_zipfile_serialization_if_available=True,
-                        include_modifiers=True
-                    )
-                    _logger.info(f'New best dense model on epoch {epoch} with accuracy {best_metric_dense:.4f}')
-
+                    _logger.info(f'New best model for sparsity {mean_sparsity:.2f} on epoch {epoch} with accuracy {best_metric:.4f}')
+                
     except KeyboardInterrupt:
         pass
     else:
         pass
-    
-    if best_metric_dense > 0.0:
-        _logger.info('*** Best metric (dense): {0} (epoch {1})'.format(best_metric_dense, best_epoch_dense))
-    if best_metric_sparse > 0.0:
-        _logger.info('*** Best metric (sparse): {0} (epoch {1})'.format(best_metric_sparse, best_epoch_sparse)) 
-
-    # save last (if requested)
-    if args.save_last and args.local_rank == 0:
-        save_model(
-            path=f'{output_dir}/{args.model}_last.pth',
-            model=model, 
-            optimizer=optimizer, 
-            loss_scaler=loss_scaler,
-            epoch=epoch,
-            use_zipfile_serialization_if_available=True,
-            include_modifiers=True
-        )    
-        _logger.info(f'Saved last training state of the model')       
-
-    # finalize pruner
+    # finalize manager
     manager.finalize(model)
+    if args.local_rank == 0:
+        if best_metric is not None:
+            _logger.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
+        _logger.info('Training completed. Have a nice day!')
+        wandb.finish()
 
 
 def train_one_epoch(
@@ -936,9 +890,7 @@ def train_one_epoch(
     amp_autocast=suppress,
     loss_scaler=None, 
     model_ema=None, 
-    mixup_fn=None,
-    loader_eval=None,
-    validate_loss_fn=None,
+    mixup_fn=None
 ):
     
     # define closure for SAM
@@ -1014,13 +966,6 @@ def train_one_epoch(
         batch_time_m.update(time.time() - end)
         lr = 0.0
 
-        if batch_idx == 0 and is_update_epoch(optimizer.wrapped_manager, epoch):
-            eval_metrics = validate(model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast)
-
-            _logger.info(f"Accuracy after pruning: {eval_metrics['top1']:>7.4f}")
-            if args.log_wandb and args.local_rank == 0:
-                wandb.log({'val_after_pruning/top1': eval_metrics['top1']}, step=epoch)
-
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
@@ -1058,19 +1003,17 @@ def train_one_epoch(
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
-        # end for
 
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    return OrderedDict([('loss', losses_m.avg), ('lr', lr)])
+    return OrderedDict([('loss', losses_m.avg)])
 
 
 def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=''):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
-    top5_m = AverageMeter()
 
     model.eval()
 
@@ -1097,12 +1040,11 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                 target = target[0:target.size(0):reduce_factor]
 
             loss = loss_fn(output, target)
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            acc1 = accuracy(output, target, topk=(1,))[0]
 
             if args.distributed:
                 reduced_loss = reduce_tensor(loss.data, args.world_size)
                 acc1 = reduce_tensor(acc1, args.world_size)
-                acc5 = reduce_tensor(acc5, args.world_size)
             else:
                 reduced_loss = loss.data
 
@@ -1110,7 +1052,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))
-            top5_m.update(acc5.item(), output.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -1120,12 +1061,11 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
                     '{0}: [{1:>4d}/{2}]  '
                     'Time: {batch_time.val:.3f} ({batch_time.avg:.3f})  '
                     'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})  '
-                    'Acc@5: {top5.val:>7.4f} ({top5.avg:>7.4f})'.format(
+                    'Acc@1: {top1.val:>7.4f} ({top1.avg:>7.4f})'.format(
                         log_name, batch_idx, last_idx, batch_time=batch_time_m,
-                        loss=losses_m, top1=top1_m, top5=top5_m))
+                        loss=losses_m, top1=top1_m))
 
-    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+    metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg)])
 
     return metrics
 
